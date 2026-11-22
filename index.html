@@ -27,7 +27,8 @@
     <!-- STEP 1: BOX -->
     <section class="step" id="step-box">
       <h2>Photo of the box picture</h2>
-      <p class="hint">Photograph the finished picture on the box lid. Then drag the four corners onto the corners of the picture itself.</p>
+      <p class="hint">Photograph the finished picture on the box lid. Then drag the four corners onto the corners of the picture itself.
+        A sideways photo is fine: the app turns it to match your puzzle.</p>
       <div class="capture-row">
         <label class="btn primary">📷 Take photo<input type="file" accept="image/*" capture="environment" data-target="box" hidden></label>
         <label class="btn">🖼️ Gallery<input type="file" accept="image/*" data-target="box" hidden></label>
@@ -37,6 +38,7 @@
         <div class="row">
           <button class="small" data-autocorners="box">Auto corners</button>
           <button class="small" data-fullcorners="box">Full image</button>
+          <button class="small" id="btn-rotate-box" title="The picture is turned: rotate its corner labels by 90°">↻ Rotate picture</button>
         </div>
         <fieldset class="grid-settings">
           <legend>Puzzle grid</legend>
@@ -75,11 +77,14 @@
     <!-- STEP 3: PIECES -->
     <section class="step" id="step-pieces" hidden>
       <h2>Photo of the loose pieces</h2>
-      <p class="hint">Spread the pieces face up on a plain, even surface (a sheet, a board, a table) so they don't touch. Then take the photo from above.</p>
+      <p class="hint">Spread the pieces face up on a plain cloth or board so they don't touch, and photograph them from above.
+        For a big puzzle, take several photos, each of a different part of the cloth. Don't photograph the same pieces twice.
+        It's fine if the floor, a chair or the box show at the edges.</p>
       <div class="capture-row">
-        <label class="btn primary">📷 Take photo<input type="file" accept="image/*" capture="environment" data-target="pieces" hidden></label>
-        <label class="btn">🖼️ Gallery<input type="file" accept="image/*" data-target="pieces" hidden></label>
+        <label class="btn primary">📷 Add photo<input type="file" accept="image/*" capture="environment" data-target="pieces" hidden></label>
+        <label class="btn">🖼️ Add from gallery<input type="file" accept="image/*" multiple data-target="pieces" hidden></label>
       </div>
+      <div id="shot-list" class="shot-list"></div>
       <div class="editor-wrap" id="pieces-wrap" hidden>
         <label class="slider">Background sensitivity <input type="range" id="seg-sens" min="0.4" max="2.0" step="0.05" value="1"></label>
         <p class="hint small" id="seg-info"></p>

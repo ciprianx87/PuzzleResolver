@@ -107,6 +107,7 @@ function buildShapes(cols, rows, S, R) {
     const left = edgePts(TL, BL, vT[r][c], vPos[r][c]).reverse();
     shapes.push([...top, ...right.slice(1), ...bottom.slice(1), ...left.slice(1)]);
   }
+  shapes.edges = { hT, vT };
   return shapes;
 }
 
@@ -205,5 +206,5 @@ export function generateDemo(seed = 7) {
   });
   addNoise(pieces, R, 12, [0.97, 1.0, 1.05]);
 
-  return { box, boxQuad, built, builtQuad, pieces, cols, rows, count: cols * rows, truth, filled };
+  return { box, boxQuad, built, builtQuad, pieces, cols, rows, count: cols * rows, truth, filled, edges: shapes.edges };
 }

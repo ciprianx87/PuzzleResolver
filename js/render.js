@@ -39,58 +39,76 @@ function arrowHead(ctx, tip, from, size) {
 }
 
 /**
- * Composite: built puzzle photo on top, pieces photo below, arrows from pieces to target cells.
+ * Composite: built puzzle photo on top, below it the pieces photos that contain this line's pieces, and arrows
+ * from each piece to its target cell.
+ * shots: Map shotId -> { img, seg, label }; each match's piece carries its shot id.
  */
 export function renderSolution(canvas, opt) {
-  const { built, builtQuad, cols, rows, piecesImg, seg, matches, lineCells } = opt;
-  const W = 1200, GAP = 28;
+  const { built, builtQuad, cols, rows, shots, matches, lineCells } = opt;
+  const W = 1200, GAP = 30;
   const Hg = homography(rectCorners(cols, rows), builtQuad); // grid coords -> built image
 
   const topBox = bboxOf(builtQuad, built.width, built.height, 0.05);
   const sT = W / topBox.w;
   const topH = Math.round(topBox.h * sT);
 
-  const pts = seg.pieces.length
-    ? seg.pieces.flatMap((p) => [{ x: p.bbox.x0, y: p.bbox.y0 }, { x: p.bbox.x1, y: p.bbox.y1 }])
-    : [{ x: 0, y: 0 }, { x: piecesImg.width, y: piecesImg.height }];
-  const botBox = bboxOf(pts, piecesImg.width, piecesImg.height, 0.04);
-  const sB = W / botBox.w;
-  const botH = Math.round(botBox.h * sB);
-  const botY = topH + GAP;
+  // one band per pieces photo that has a match in this line (or the first photo if there is none)
+  let ids = [...new Set(matches.map((m) => m.piece.shot))];
+  if (!ids.length && shots.size) ids = [shots.keys().next().value];
+  const bands = new Map();
+  let y = topH;
+  for (const id of ids) {
+    const { img, seg } = shots.get(id);
+    const pts = seg.pieces.length
+      ? seg.pieces.flatMap((p) => [{ x: p.bbox.x0, y: p.bbox.y0 }, { x: p.bbox.x1, y: p.bbox.y1 }])
+      : [{ x: 0, y: 0 }, { x: img.width, y: img.height }];
+    const box = bboxOf(pts, img.width, img.height, 0.04);
+    const sc = W / box.w;
+    const h = Math.round(box.h * sc);
+    bands.set(id, { box, s: sc, y: y + GAP, h });
+    y += GAP + h;
+  }
 
-  canvas.width = W; canvas.height = botY + botH;
+  canvas.width = W; canvas.height = y;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#1d2733';
   ctx.fillRect(0, 0, W, canvas.height);
   ctx.drawImage(built, topBox.x, topBox.y, topBox.w, topBox.h, 0, 0, W, topH);
 
-  // tinted overlay for matched pieces
-  const tint = document.createElement('canvas');
-  tint.width = piecesImg.width; tint.height = piecesImg.height;
-  const tctx = tint.getContext('2d');
-  const tdata = tctx.createImageData(tint.width, tint.height);
-  matches.forEach((m, i) => {
-    const col = hexToRgb(COLORS[i % COLORS.length]);
-    const { bbox, id } = m.piece;
-    for (let y = bbox.y0; y <= bbox.y1; y++) for (let x = bbox.x0; x <= bbox.x1; x++) {
-      const p = y * seg.w + x;
-      if (seg.labels[p] !== id) continue;
-      tdata.data[p * 4] = col[0]; tdata.data[p * 4 + 1] = col[1]; tdata.data[p * 4 + 2] = col[2];
-      tdata.data[p * 4 + 3] = isLow(m) ? 70 : 115;
-    }
-  });
-  tctx.putImageData(tdata, 0, 0);
-  ctx.drawImage(piecesImg, botBox.x, botBox.y, botBox.w, botBox.h, 0, botY, W, botH);
-  ctx.drawImage(tint, botBox.x, botBox.y, botBox.w, botBox.h, 0, botY, W, botH);
-
-  // separator label
+  for (const [id, band] of bands) {
+    const { img, seg, label } = shots.get(id);
+    // tinted overlay for this photo's matched pieces
+    const tint = document.createElement('canvas');
+    tint.width = img.width; tint.height = img.height;
+    const tctx = tint.getContext('2d');
+    const tdata = tctx.createImageData(tint.width, tint.height);
+    matches.forEach((m, i) => {
+      if (m.piece.shot !== id) return;
+      const col = hexToRgb(COLORS[i % COLORS.length]);
+      const { bbox, id: pid } = m.piece;
+      for (let yy = bbox.y0; yy <= bbox.y1; yy++) for (let x = bbox.x0; x <= bbox.x1; x++) {
+        const q = yy * seg.w + x;
+        if (seg.labels[q] !== pid) continue;
+        tdata.data[q * 4] = col[0]; tdata.data[q * 4 + 1] = col[1]; tdata.data[q * 4 + 2] = col[2];
+        tdata.data[q * 4 + 3] = isLow(m) ? 70 : 115;
+      }
+    });
+    tctx.putImageData(tdata, 0, 0);
+    const { box } = band;
+    ctx.drawImage(img, box.x, box.y, box.w, box.h, 0, band.y, W, band.h);
+    ctx.drawImage(tint, box.x, box.y, box.w, box.h, 0, band.y, W, band.h);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = 'bold 16px system-ui, sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(`▼ loose pieces${label ? ' · ' + label : ''}`, 12, band.y - GAP / 2);
+  }
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText('▲ puzzle            ▼ loose pieces', 12, topH + GAP / 2);
 
   const toTop = (gx, gy) => { const p = applyH(Hg, gx, gy); return { x: (p.x - topBox.x) * sT, y: (p.y - topBox.y) * sT }; };
-  const toBot = (x, y) => ({ x: (x - botBox.x) * sB, y: botY + (y - botBox.y) * sB });
+  const toBot = (piece) => {
+    const b = bands.get(piece.shot);
+    return { x: (piece.cx - b.box.x) * b.s, y: b.y + (piece.cy - b.box.y) * b.s };
+  };
   const cellPoly = (cell) => {
     const c = cell % cols, r = (cell / cols) | 0;
     return [toTop(c, r), toTop(c + 1, r), toTop(c + 1, r + 1), toTop(c, r + 1)];
@@ -122,7 +140,7 @@ export function renderSolution(canvas, opt) {
     const col = COLORS[i % COLORS.length];
     const poly = cellPoly(m.cell);
     const Q = { x: poly.reduce((s, p) => s + p.x, 0) / 4, y: poly.reduce((s, p) => s + p.y, 0) / 4 };
-    const P = toBot(m.piece.cx, m.piece.cy);
+    const P = toBot(m.piece);
     const dy = P.y - Q.y;
     const c1 = { x: P.x, y: P.y - dy * 0.35 }, c2 = { x: Q.x, y: Q.y + dy * 0.35 };
     // end the curve just outside the badge
@@ -143,8 +161,8 @@ export function renderSolution(canvas, opt) {
   // piece "top" markers and badges (drawn last so they sit above arrows)
   matches.forEach((m, i) => {
     const col = COLORS[i % COLORS.length];
-    const P = toBot(m.piece.cx, m.piece.cy);
-    const len = m.piece.side * sB * 0.62;
+    const P = toBot(m.piece);
+    const len = m.piece.side * bands.get(m.piece.shot).s * 0.62;
     const dir = { x: Math.sin(m.angle), y: -Math.cos(m.angle) };
     const T = { x: P.x + dir.x * len, y: P.y + dir.y * len };
     ctx.beginPath(); ctx.moveTo(P.x, P.y); ctx.lineTo(T.x, T.y);
@@ -175,7 +193,8 @@ export function rotationText(angle) {
 }
 
 /** Upright thumbnail of a piece and the matching area of the box picture. */
-export function matchCard(m, i, piecesImg, refRect, cols, rows) {
+export function matchCard(m, i, shots, refRect, cols, rows) {
+  const piecesImg = shots.get(m.piece.shot).img;
   const card = document.createElement('div');
   card.className = 'match-card' + (isLow(m) ? ' low' : '');
   const col = COLORS[i % COLORS.length];
@@ -233,8 +252,8 @@ export function renderPieces(canvas, piecesImg, seg) {
   ctx.drawImage(piecesImg, 0, 0);
   const tint = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const d = tint.data, L = seg.labels, w = seg.w, h = seg.h;
-  const clusterIds = new Set(seg.pieces.filter((p) => p.cluster).map((p) => p.id));
-  const ids = new Set(seg.pieces.map((p) => p.id));
+  const clusterIds = new Set((seg.clusters || []).map((c) => c.id));
+  const ids = new Set([...seg.pieces.map((p) => p.id), ...clusterIds]);
   for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
     const p = y * w + x, id = L[p];
     if (!id || !ids.has(id)) continue;
@@ -286,7 +305,7 @@ function drawPieceInCell(ctx, cut, piece, angle, x, y, cw, ch) {
  * placements: [{cell, piece, angle, confidence, placed?}]; cells without a placement that are still empty show the
  * box picture faded, so the gaps are easy to see.
  */
-export function renderPreview(canvas, { builtRect, refRect, piecesImg, seg, cols, rows, filled, placements, markUncertain = true }) {
+export function renderPreview(canvas, { builtRect, refRect, shots, cols, rows, filled, placements, markUncertain = true }) {
   const k = Math.max(1, 1000 / builtRect.width); // render big enough to see detail even for small grids
   const W = Math.round(builtRect.width * k), H = Math.round(builtRect.height * k);
   canvas.width = W; canvas.height = H;
@@ -321,7 +340,8 @@ export function renderPreview(canvas, { builtRect, refRect, piecesImg, seg, cols
   // pieces, tabs included, so they also cover the gaps their neighbours leave
   for (const pl of placements) {
     const c = pl.cell % cols, r = (pl.cell / cols) | 0;
-    drawPieceInCell(ctx, cutOut(piecesImg, seg, pl.piece), pl.piece, pl.angle, c * cw, r * ch, cw, ch);
+    const shot = shots.get(pl.piece.shot);
+    drawPieceInCell(ctx, cutOut(shot.img, shot.seg, pl.piece), pl.piece, pl.angle, c * cw, r * ch, cw, ch);
   }
   // faint grid
   ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 1;
