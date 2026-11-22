@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1d2733">
+  <title>Puzzle Resolver</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>🧩 Puzzle Resolver</h1>
+    <button id="btn-demo" class="ghost small" title="Load a synthetic puzzle to try the app">Demo</button>
+    <button id="btn-reset" class="ghost small" title="Clear all photos and settings">Reset</button>
+  </header>
+
+  <nav class="steps" id="steps">
+    <button data-step="box" class="active"><span>1</span>Box</button>
+    <button data-step="built"><span>2</span>Built</button>
+    <button data-step="pieces"><span>3</span>Pieces</button>
+    <button data-step="solve"><span>4</span>Solve</button>
+  </nav>
+
+  <main>
+    <!-- STEP 1: BOX -->
+    <section class="step" id="step-box">
+      <h2>Photo of the box picture</h2>
+      <p class="hint">Photograph the finished picture on the box lid. Then drag the four corners onto the corners of the picture itself.</p>
+      <div class="capture-row">
+        <label class="btn primary">📷 Take photo<input type="file" accept="image/*" capture="environment" data-target="box" hidden></label>
+        <label class="btn">🖼️ Gallery<input type="file" accept="image/*" data-target="box" hidden></label>
+      </div>
+      <div class="editor-wrap" id="box-editor-wrap" hidden>
+        <canvas id="box-editor" class="editor"></canvas>
+        <div class="row">
+          <button class="small" data-autocorners="box">Auto corners</button>
+          <button class="small" data-fullcorners="box">Full image</button>
+        </div>
+        <fieldset class="grid-settings">
+          <legend>Puzzle grid</legend>
+          <label>Pieces (total) <input type="number" id="piece-count" min="4" max="5000" step="1" value="500"></label>
+          <div class="row">
+            <label>Columns <input type="number" id="grid-cols" min="2" max="100" value="25"></label>
+            <label>Rows <input type="number" id="grid-rows" min="2" max="100" value="20"></label>
+          </div>
+          <p class="hint small">Columns and rows are estimated from the piece count and the picture's shape. Count the pieces along one edge to correct them if needed.</p>
+        </fieldset>
+      </div>
+      <div class="nav-row"><span></span><button class="primary" data-goto="built">Next →</button></div>
+    </section>
+
+    <!-- STEP 2: BUILT -->
+    <section class="step" id="step-built" hidden>
+      <h2>Photo of what is already built</h2>
+      <p class="hint">Photograph the puzzle from straight above. Drag the corners to where the corners of the <b>finished</b> puzzle will be. The border is usually done first, so this is easy.</p>
+      <div class="capture-row">
+        <label class="btn primary">📷 Take photo<input type="file" accept="image/*" capture="environment" data-target="built" hidden></label>
+        <label class="btn">🖼️ Gallery<input type="file" accept="image/*" data-target="built" hidden></label>
+      </div>
+      <div class="editor-wrap" id="built-editor-wrap" hidden>
+        <canvas id="built-editor" class="editor"></canvas>
+        <div class="row">
+          <button class="small" data-autocorners="built">Auto corners</button>
+          <button class="small" data-fullcorners="built">Full image</button>
+        </div>
+        <h3>Filled cells <button class="small" id="btn-detect">Reset to detected</button></h3>
+        <p class="hint small">Green cells are detected as already placed. Tap a cell to toggle it. Your corrections are remembered.</p>
+        <canvas id="filled-canvas" class="editor"></canvas>
+      </div>
+      <div class="nav-row"><button data-goto="box">← Back</button><button class="primary" data-goto="pieces">Next →</button></div>
+    </section>
+
+    <!-- STEP 3: PIECES -->
+    <section class="step" id="step-pieces" hidden>
+      <h2>Photo of the loose pieces</h2>
+      <p class="hint">Spread the pieces face up on a plain, even surface (a sheet, a board, a table) so they don't touch. Then take the photo from above.</p>
+      <div class="capture-row">
+        <label class="btn primary">📷 Take photo<input type="file" accept="image/*" capture="environment" data-target="pieces" hidden></label>
+        <label class="btn">🖼️ Gallery<input type="file" accept="image/*" data-target="pieces" hidden></label>
+      </div>
+      <div class="editor-wrap" id="pieces-wrap" hidden>
+        <label class="slider">Background sensitivity <input type="range" id="seg-sens" min="0.4" max="2.0" step="0.05" value="1"></label>
+        <p class="hint small" id="seg-info"></p>
+        <canvas id="pieces-canvas" class="editor"></canvas>
+      </div>
+      <div class="nav-row"><button data-goto="built">← Back</button><button class="btn-preview">👁 Preview</button><button class="primary" data-goto="solve">Solve →</button></div>
+    </section>
+
+    <!-- STEP 4: SOLVE -->
+    <section class="step" id="step-solve" hidden>
+      <h2>Next line</h2>
+      <div class="solve-controls">
+        <div class="seg-toggle">
+          <button id="mode-row" class="active">Rows</button>
+          <button id="mode-col">Columns</button>
+        </div>
+        <div class="line-picker">
+          <button id="line-prev" class="small">◀</button>
+          <span id="line-label">Row 1</span>
+          <button id="line-next" class="small">▶</button>
+        </div>
+      </div>
+      <p class="hint small" id="solve-info"></p>
+      <canvas id="solve-canvas" class="editor"></canvas>
+      <div class="row">
+        <button id="btn-placed" class="primary">✓ I placed these</button>
+        <button class="btn-preview">👁 Preview completed puzzle</button>
+        <button id="btn-zoom-toggle" class="small">Open full image</button>
+      </div>
+      <h3>Matches</h3>
+      <div id="match-list" class="match-list"></div>
+      <div class="nav-row"><button data-goto="pieces">← Back</button><span></span></div>
+    </section>
+  </main>
+
+  <div id="preview" class="preview" hidden role="dialog" aria-modal="true" aria-labelledby="preview-title">
+    <div class="preview-head">
+      <h2 id="preview-title">Preview</h2>
+      <button id="preview-close" class="small" aria-label="Close preview">✕</button>
+    </div>
+    <div class="preview-body">
+      <p class="hint small" id="preview-info"></p>
+      <canvas id="preview-canvas" class="editor"></canvas>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="preview-mark" checked> Mark uncertain pieces</label>
+        <button id="preview-save" class="small">Open full image</button>
+      </div>
+      <p class="hint small">Every loose piece in the photo is placed at once, in its best spot. Orange dashed cells are
+        guesses. Hatched cells have no matching piece in the photo yet.</p>
+    </div>
+  </div>
+
+  <div id="busy" class="busy" hidden><div class="spinner"></div><div id="busy-text">Working…</div></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "Puzzle Resolver",
+  "short_name": "Puzzle",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f4f1ea",
+  "theme_color": "#1d2733",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
