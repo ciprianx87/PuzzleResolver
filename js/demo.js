@@ -79,7 +79,7 @@ function bez(p0, p1, p2, p3, n, out) {
 }
 
 /** Points of an edge from A to B with a tab of signed amplitude `amp` (absolute +y / +x direction), centre at `t`. */
-function edgePts(A, B, amp, t = 0.5) {
+function edgePts(A, B, amp, t = 0.5, wd = 1) {
   const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy);
   const horizontal = Math.abs(dx) > Math.abs(dy);
   const nx = horizontal ? 0 : 1, ny = horizontal ? 1 : 0; // absolute normal
@@ -87,24 +87,33 @@ function edgePts(A, B, amp, t = 0.5) {
   const pts = [{ ...A }];
   if (!amp) { pts.push({ ...B }); return pts; }
   const h = amp;
-  pts.push(P(t - 0.13, 0));
-  bez(P(t - 0.13, 0), P(t - 0.08, 0), P(t - 0.2, h), P(t, h), 10, pts);
-  bez(P(t, h), P(t + 0.2, h), P(t + 0.08, 0), P(t + 0.13, 0), 10, pts);
+  const n = 0.13 * wd, k = 0.08 * wd, e = 0.2 * wd; // neck, shoulder and head widths
+  pts.push(P(t - n, 0));
+  bez(P(t - n, 0), P(t - k, 0), P(t - e, h), P(t, h), 10, pts);
+  bez(P(t, h), P(t + e, h), P(t + k, 0), P(t + n, 0), 10, pts);
   pts.push({ ...B });
   return pts;
 }
 
 function buildShapes(cols, rows, S, R) {
-  const hT = [], vT = [], hPos = [], vPos = [];
-  for (let r = 0; r <= rows; r++) { hT.push([]); hPos.push([]); for (let c = 0; c < cols; c++) { hT[r].push(r === 0 || r === rows ? 0 : (R() < 0.5 ? 1 : -1) * 0.24); hPos[r].push(0.5 + (R() - 0.5) * 0.1); } }
-  for (let r = 0; r < rows; r++) { vT.push([]); vPos.push([]); for (let c = 0; c <= cols; c++) { vT[r].push(c === 0 || c === cols ? 0 : (R() < 0.5 ? 1 : -1) * 0.24); vPos[r].push(0.5 + (R() - 0.5) * 0.1); } }
+  // tabs vary in position, depth and width, as on a real puzzle: that is what tells look-alike pieces apart
+  const hT = [], vT = [], hPos = [], vPos = [], hW = [], vW = [];
+  const amp = () => (R() < 0.5 ? 1 : -1) * (0.19 + R() * 0.09);
+  for (let r = 0; r <= rows; r++) {
+    hT.push([]); hPos.push([]); hW.push([]);
+    for (let c = 0; c < cols; c++) { hT[r].push(r === 0 || r === rows ? 0 : amp()); hPos[r].push(0.5 + (R() - 0.5) * 0.2); hW[r].push(0.8 + R() * 0.4); }
+  }
+  for (let r = 0; r < rows; r++) {
+    vT.push([]); vPos.push([]); vW.push([]);
+    for (let c = 0; c <= cols; c++) { vT[r].push(c === 0 || c === cols ? 0 : amp()); vPos[r].push(0.5 + (R() - 0.5) * 0.2); vW[r].push(0.8 + R() * 0.4); }
+  }
   const shapes = [];
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
     const TL = { x: c * S, y: r * S }, TR = { x: (c + 1) * S, y: r * S }, BR = { x: (c + 1) * S, y: (r + 1) * S }, BL = { x: c * S, y: (r + 1) * S };
-    const top = edgePts(TL, TR, hT[r][c], hPos[r][c]);
-    const right = edgePts(TR, BR, vT[r][c + 1], vPos[r][c + 1]);
-    const bottom = edgePts(BL, BR, hT[r + 1][c], hPos[r + 1][c]).reverse();
-    const left = edgePts(TL, BL, vT[r][c], vPos[r][c]).reverse();
+    const top = edgePts(TL, TR, hT[r][c], hPos[r][c], hW[r][c]);
+    const right = edgePts(TR, BR, vT[r][c + 1], vPos[r][c + 1], vW[r][c + 1]);
+    const bottom = edgePts(BL, BR, hT[r + 1][c], hPos[r + 1][c], hW[r + 1][c]).reverse();
+    const left = edgePts(TL, BL, vT[r][c], vPos[r][c], vW[r][c]).reverse();
     shapes.push([...top, ...right.slice(1), ...bottom.slice(1), ...left.slice(1)]);
   }
   shapes.edges = { hT, vT };
@@ -143,10 +152,19 @@ function texture(ctx, w, h, base, streak, R, vertical = false) {
 
 const tp = (m, x, y) => { const p = m.transformPoint(new DOMPoint(x, y)); return { x: p.x, y: p.y }; };
 
-export function generateDemo(seed = 7) {
+/** A plain sky: a smooth gradient, where only the outlines tell pieces apart (used to test outline matching). */
+function drawPlain(w, h) {
+  const c = makeCanvas(w, h), ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, w * 0.3, h);
+  g.addColorStop(0, '#a3b3e3'); g.addColorStop(1, '#bcb4e6');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+  return c;
+}
+
+export function generateDemo(seed = 7, { plain = false } = {}) {
   const R = rng(seed);
   const cols = 8, rows = 6, S = 70, PW = cols * S, PH = rows * S;
-  const pic = drawPicture(PW, PH, R);
+  const pic = plain ? drawPlain(PW, PH) : drawPicture(PW, PH, R);
   const shapes = buildShapes(cols, rows, S, R);
 
   // 1. box photo: picture printed on a box lid, slightly rotated, on a dark table
@@ -201,7 +219,11 @@ export function generateDemo(seed = 7) {
     pctx.shadowColor = 'rgba(0,0,0,0.35)'; pctx.shadowBlur = 4;
     pathOf(pctx, shapes[idx]); pctx.fillStyle = '#ddd'; pctx.fill();
     pctx.shadowColor = 'transparent';
-    pathOf(pctx, shapes[idx]); pctx.clip(); pctx.drawImage(pic, 0, 0);
+    pathOf(pctx, shapes[idx]); pctx.clip();
+    // plain sky: uneven light across the photo shifts each piece's colour more than the gradient differs
+    if (plain) pctx.filter = `brightness(${(0.92 + R() * 0.16).toFixed(3)}) hue-rotate(${((R() - 0.5) * 12).toFixed(1)}deg)`;
+    pctx.drawImage(pic, 0, 0);
+    pctx.filter = 'none';
     pctx.restore();
   });
   addNoise(pieces, R, 12, [0.97, 1.0, 1.05]);

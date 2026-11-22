@@ -46,7 +46,9 @@ function arrowHead(ctx, tip, from, size) {
 export function renderSolution(canvas, opt) {
   const { built, builtQuad, cols, rows, shots, matches, lineCells } = opt;
   const W = 1200, GAP = 30;
-  const Hg = homography(rectCorners(cols, rows), builtQuad); // grid coords -> built image
+  // grid coords -> built image (following the bowed frame when known, see gridmap.js)
+  const Hg = homography(rectCorners(cols, rows), builtQuad);
+  const gridToPx = opt.gridToPx || ((gx, gy) => { const p = applyH(Hg, gx, gy); return [p.x, p.y]; });
 
   const topBox = bboxOf(builtQuad, built.width, built.height, 0.05);
   const sT = W / topBox.w;
@@ -104,7 +106,7 @@ export function renderSolution(canvas, opt) {
   }
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
 
-  const toTop = (gx, gy) => { const p = applyH(Hg, gx, gy); return { x: (p.x - topBox.x) * sT, y: (p.y - topBox.y) * sT }; };
+  const toTop = (gx, gy) => { const [x, y] = gridToPx(gx, gy); return { x: (x - topBox.x) * sT, y: (y - topBox.y) * sT }; };
   const toBot = (piece) => {
     const b = bands.get(piece.shot);
     return { x: (piece.cx - b.box.x) * b.s, y: b.y + (piece.cy - b.box.y) * b.s };

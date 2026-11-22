@@ -1,5 +1,7 @@
 // Appearance descriptors and matching of pieces to puzzle cells.
 import { sample3, otsu, median } from './imageutil.js';
+import { invertH } from './geometry.js';
+import { PROFILE_T, PROFILE_D, coverToEdge, straighten, classify, profileDist } from './outline.js';
 
 export const N = 8;          // descriptor grid is N x N
 const INNER = 0.84;          // fraction of the cell/core that is sampled
@@ -176,51 +178,143 @@ export function detectFilled(builtSets, refDescs) {
   return { filled, dists };
 }
 
+const SIDES = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // top, right, bottom, left (outward normals)
+
+/** Map grid coordinates to photo pixels with homography H (see gridmap.js for the general mapping). */
+function gridToPx(H, gx, gy) {
+  const W = H[6] * gx + H[7] * gy + H[8];
+  return [(H[0] * gx + H[1] * gy + H[2]) / W, (H[3] * gx + H[4] * gy + H[5]) / W];
+}
+
 /**
- * What each empty cell needs on each side, as far as the built photo tells:
- *  - a side on the puzzle's edge needs a flat edge ('F'); any other side must not be flat ('N');
- *  - next to a piece that was assembled in the photo: if that piece's tab pokes into this cell, the new piece needs
- *    a blank there ('B'), otherwise a tab ('T').
- * assembled: the built photo's assembled-puzzle mask (or null); photoFilled: cells filled in the photo itself.
+ * Outline of the hole an assembled neighbour leaves on side t of an empty cell: how much of the strip across that
+ * edge is not assembled puzzle in the built photo (see outline.js). Straightened, or null.
  */
-export function cellRequirements(emptyCells, cols, rows, filled, photoFilled, assembled, H) {
-  const out = new Map();
-  const cover = (gx0, gy0, gx1, gy1) => {
-    let hit = 0, n = 0;
-    for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
-      const gx = gx0 + ((gx1 - gx0) * (i + 0.5)) / 4, gy = gy0 + ((gy1 - gy0) * (j + 0.5)) / 4;
-      const W = H[6] * gx + H[7] * gy + H[8];
-      const x = Math.round((H[0] * gx + H[1] * gy + H[2]) / W), y = Math.round((H[3] * gx + H[4] * gy + H[5]) / W);
-      n++;
-      if (x >= 0 && y >= 0 && x < assembled.w && y < assembled.h && assembled.mask[y * assembled.w + x]) hit++;
-    }
-    return hit / n;
+function holeProfile(assembled, toPx, c, r, t) {
+  const [nu, nv] = SIDES[t], tu = -nv, tv = nu;
+  const { mask, w, h } = assembled;
+  const free = (gx, gy) => {
+    const [x, y] = toPx(gx, gy), xi = Math.round(x), yi = Math.round(y);
+    return !(xi >= 0 && yi >= 0 && xi < w && yi < h && mask[yi * w + xi] === 1);
   };
+  const raw = PROFILE_T.map((tt) => {
+    let n = 0;
+    for (const d of PROFILE_D) if (free(c + 0.5 + nu * d + tu * tt, r + 0.5 + nv * d + tv * tt)) n++;
+    return coverToEdge(n);
+  });
+  return straighten(raw);
+}
+
+/**
+ * What each empty cell needs on each side, as far as the built photo tells. Returns Map cell -> [top, right,
+ * bottom, left] with:
+ *  - 'F' on the puzzle's edge (flat side), 'N' (not flat) for an interior side next to a cell that is still empty
+ *    or was filled after the photo;
+ *  - next to a piece assembled in the photo: 'B' / 'T' (blank / tab) or null if unclear, and the outline of the
+ *    hole that neighbour leaves in `.prof[t]` (straightened profile, see outline.js).
+ * assembled: the built photo's assembled-puzzle mask (or null); photoFilled: cells filled in the photo itself;
+ * toPx(gx, gy) -> [x, y]: where grid points are in the built photo (see gridmap.js).
+ */
+export function cellRequirements(emptyCells, cols, rows, filled, photoFilled, assembled, toPx) {
+  const out = new Map();
   for (const cell of emptyCells) {
     const c = cell % cols, r = (cell / cols) | 0;
     const nb = [r > 0 ? cell - cols : -1, c < cols - 1 ? cell + 1 : -1, r < rows - 1 ? cell + cols : -1, c > 0 ? cell - 1 : -1];
-    // the band of this cell, just inside each side, in its middle: where a neighbour's tab would poke in
-    const band = [
-      [c + 0.4, r + 0.04, c + 0.6, r + 0.18], [c + 0.82, r + 0.4, c + 0.96, r + 0.6],
-      [c + 0.4, r + 0.82, c + 0.6, r + 0.96], [c + 0.04, r + 0.4, c + 0.18, r + 0.6],
-    ];
-    out.set(cell, nb.map((n, t) => {
+    const prof = [null, null, null, null];
+    const need = nb.map((n, t) => {
       if (n < 0) return 'F';
       if (!filled[n]) return 'N';
       if (!assembled || !photoFilled || !photoFilled[n]) return 'N'; // placed later: shape unknown
-      const v = cover(...band[t]);
-      return v > 0.45 ? 'B' : v < 0.12 ? 'T' : 'N';
-    }));
+      prof[t] = holeProfile(assembled, toPx, c, r, t);
+      const k = classify(prof[t]);
+      return k === 'F' ? 'N' : k; // a neighbour inside the puzzle never leaves a straight edge
+    });
+    need.prof = prof;
+    out.set(cell, need);
   }
   return out;
 }
 
 /**
- * Structural detection: a cell is filled when the assembled puzzle (as opposed to bare cloth or loose pieces)
- * covers the middle of the cell. assembled: Uint8Array mask over the built photo; H maps grid coordinates
- * (0..cols, 0..rows) to photo pixels. Small offsets absorb a bowed border or lens distortion.
+ * Which sides of the puzzle's border are complete in the built photo: in a band around that edge, the mask runs
+ * unbroken from one corner to the other, or covers the whole length apart from short gaps (pieces whose colour is
+ * close to the cloth's drop out of the mask). The band is generous (about a cell either way), so a bowed border or
+ * imprecise corners don't matter. Returns [top, right, bottom, left] booleans.
  */
-export function filledFromCoverage(assembled, w, h, H, cols, rows, minCover = 0.55) {
+export function completeBorderSides(assembled, H, cols, rows) {
+  const { mask, w, h } = assembled, Hi = invertH(H);
+  const g = new Float32Array(w * h * 2); // grid coordinates of every pixel
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const W = Hi[6] * x + Hi[7] * y + Hi[8];
+    g[(y * w + x) * 2] = (Hi[0] * x + Hi[1] * y + Hi[2]) / W;
+    g[(y * w + x) * 2 + 1] = (Hi[3] * x + Hi[4] * y + Hi[5]) / W;
+  }
+  const M = 1.2; // band reaches this many cells outside / inside the edge
+  const sides = [
+    { inBand: (gx, gy) => gy > -M && gy < 1 + M && gx > -M && gx < cols + M, along: (gx) => gx, len: cols },
+    { inBand: (gx, gy) => gx > cols - 1 - M && gx < cols + M && gy > -M && gy < rows + M, along: (gx, gy) => gy, len: rows },
+    { inBand: (gx, gy) => gy > rows - 1 - M && gy < rows + M && gx > -M && gx < cols + M, along: (gx) => gx, len: cols },
+    { inBand: (gx, gy) => gx > -M && gx < 1 + M && gy > -M && gy < rows + M, along: (gx, gy) => gy, len: rows },
+  ];
+  // seams between pieces can look like cloth in a far-away photo: step over gaps of a few pixels
+  const [ax, ay] = gridToPx(H, cols / 2, rows / 2), [bx, by] = gridToPx(H, cols / 2 + 1, rows / 2);
+  const R = Math.max(2, Math.round(Math.hypot(bx - ax, by - ay) * 0.08));
+  const offs = [];
+  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) if (dx || dy) offs.push([dx, dy]);
+  const seen = new Uint8Array(w * h), queue = new Int32Array(w * h);
+  const cellArea = Math.hypot(bx - ax, by - ay) ** 2;
+  const covered = ({ inBand, along, len }) => {
+    // coverage in half-cell steps; the longest uncovered stretch (in cells) and the uncovered fraction
+    const bins = new Float32Array(len * 2);
+    for (let p = 0; p < w * h; p++) {
+      if (mask[p] !== 1 || !inBand(g[p * 2], g[p * 2 + 1])) continue;
+      const b = Math.floor(along(g[p * 2], g[p * 2 + 1]) * 2);
+      if (b >= 0 && b < bins.length) bins[b]++;
+    }
+    let run = 0, maxRun = 0, empty = 0;
+    for (const v of bins) {
+      if (v < cellArea * 0.1) { run++; empty++; maxRun = Math.max(maxRun, run); } else run = 0;
+    }
+    return maxRun <= 6 && empty <= bins.length * 0.15;
+  };
+  return sides.map((side) => {
+    const { inBand, along, len } = side;
+    if (covered(side)) return true;
+    seen.fill(0);
+    let qh = 0, qt = 0;
+    const ok = (p) => mask[p] === 1 && inBand(g[p * 2], g[p * 2 + 1]);
+    for (let p = 0; p < w * h; p++) {
+      if (ok(p) && along(g[p * 2], g[p * 2 + 1]) < 0.6) { seen[p] = 1; queue[qt++] = p; }
+    }
+    while (qh < qt) {
+      const p = queue[qh++];
+      if (along(g[p * 2], g[p * 2 + 1]) > len - 0.6) return true;
+      const x = p % w, y = (p / w) | 0;
+      for (const [dx, dy] of offs) {
+        const X = x + dx, Y = y + dy;
+        if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+        const q = Y * w + X;
+        if (!seen[q] && ok(q)) { seen[q] = 1; queue[qt++] = q; }
+      }
+    }
+    return false;
+  });
+}
+
+/** Cells along the given complete border sides ([top, right, bottom, left] booleans). */
+export function borderCells(sides, cols, rows) {
+  const out = [];
+  for (let c = 0; c < cols; c++) { if (sides[0]) out.push(c); if (sides[2]) out.push((rows - 1) * cols + c); }
+  for (let r = 0; r < rows; r++) { if (sides[3]) out.push(r * cols); if (sides[1]) out.push(r * cols + cols - 1); }
+  return out;
+}
+
+/**
+ * Structural detection: a cell is filled when the assembled puzzle (as opposed to bare cloth or loose pieces)
+ * covers the middle of the cell. assembled: Uint8Array mask over the built photo; toPx(gx, gy) -> [x, y] maps grid
+ * coordinates (0..cols, 0..rows) to photo pixels. Small offsets absorb a bowed border or lens distortion.
+ */
+export function filledFromCoverage(assembled, w, h, toPx, cols, rows, minCover = 0.55) {
   const S = 6, offs = [];
   for (const dy of [-0.2, 0, 0.2]) for (const dx of [-0.2, 0, 0.2]) offs.push([dx, dy]);
   const filled = new Uint8Array(cols * rows), cover = new Float32Array(cols * rows);
@@ -230,8 +324,7 @@ export function filledFromCoverage(assembled, w, h, H, cols, rows, minCover = 0.
       let hit = 0;
       for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
         const gx = c + dx + 0.15 + (0.7 * (i + 0.5)) / S, gy = r + dy + 0.15 + (0.7 * (j + 0.5)) / S;
-        const W = H[6] * gx + H[7] * gy + H[8];
-        const x = Math.round((H[0] * gx + H[1] * gy + H[2]) / W), y = Math.round((H[3] * gx + H[4] * gy + H[5]) / W);
+        const [fx, fy] = toPx(gx, gy), x = Math.round(fx), y = Math.round(fy);
         if (x >= 0 && y >= 0 && x < w && y < h && assembled[y * w + x]) hit++;
       }
       best = Math.max(best, hit / (S * S));
@@ -260,6 +353,10 @@ export function describePieces(seg) {
  */
 /** Score added per side whose shape contradicts what the cell needs (flat border, tab or blank). */
 export const SHAPE_PENALTY = 9;
+/** Score per unit of outline disagreement (mean deviation in side units) with an assembled neighbour's hole. */
+export const OUTLINE_WEIGHT = 120;
+const OUTLINE_UNKNOWN = 0.07; // assumed disagreement when the piece's side outline couldn't be measured
+const OUTLINE_CENTER = 0.06;  // typical disagreement of a wrong piece
 
 /**
  * Is a piece's side shape compatible with what a cell needs? need: 'F' flat (border), 'T' / 'B' (tab / blank, from
@@ -271,7 +368,7 @@ function sideMismatch(have, need) {
   return have === need ? 0 : 1;
 }
 
-export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null) {
+export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outlineWeight = OUTLINE_WEIGHT) {
   // cellNeeds (optional): Map cell -> [top, right, bottom, left] side requirements (see sideMismatch)
   // calibrate the pieces' colours against the region that is still empty: those are the same picture parts.
   // Done per photo, since each photo has its own lighting and white balance.
@@ -288,7 +385,7 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null) {
     cals.set(k, makeCalib(pStats, rStats, list.length >= 20 ? 0.6 : 0.3));
   }
   const P = pieces.length, C = emptyCells.length;
-  const score = new Float32Array(P * C), rot = new Uint8Array(P * C);
+  const score = new Float32Array(P * C), rot = new Uint8Array(P * C), score4 = new Float32Array(P * C * 4);
   pieces.forEach((p, pi) => {
     const cal = cals.get(p.shot ?? 0);
     const cd = p.descs.map((x) => applyCalib(x.d, cal));
@@ -303,22 +400,36 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null) {
           let m = 0;
           for (let t = 0; t < 4; t++) m += sideMismatch(p.sides[(t + k) % 4], need[t]);
           v += m * SHAPE_PENALTY;
+          if (need.prof && p.profiles) {
+            // (centred, so cells next to assembled pieces are not less attractive than cells without outlines)
+            for (let t = 0; t < 4; t++) if (need.prof[t]) v += outlineCost(p.profiles[(t + k) % 4], need.prof[t], outlineWeight);
+          }
         }
+        score4[(pi * C + ci) * 4 + k] = v;
         if (v < best) { best = v; bk = k; }
       }
       score[pi * C + ci] = best; rot[pi * C + ci] = bk;
     }
   });
-  return { score, rot, cells: emptyCells };
+  return { score, score4, rot, cells: emptyCells, outlineWeight };
+}
+
+/** Outline cost of fitting a piece side (straightened profile) into a hole outline. */
+function outlineCost(prof, hole, weight) {
+  const d = profileDist(prof, hole);
+  return weight * (Math.min(0.2, Number.isFinite(d) ? d : OUTLINE_UNKNOWN) - OUTLINE_CENTER);
 }
 
 /**
- * Assign pieces to the empty cells of one line.
+ * Assign pieces to the empty cells of one line, one cell at a time, most confident first.
  * Confidence combines how much better the cell is than other cells for that piece, and how much better the piece is
  * than other pieces for that cell (two-way softmax).
+ * Outlines are chained: once a piece is proposed for a cell, the hole it leaves in the next cells of the line is
+ * known (its own side outline, seen from the other side), which narrows down look-alike pieces for those cells.
+ * cols: grid width, needed for the chaining (0 turns it off).
  */
-export function solveLine(scored, pieces, lineCells, excludePieces = new Set()) {
-  const { score, rot, cells } = scored;
+export function solveLine(scored, pieces, lineCells, excludePieces = new Set(), cols = 0) {
+  const { score, score4, rot, cells, outlineWeight = OUTLINE_WEIGHT } = scored;
   const C = cells.length, P = pieces.length;
   const colOf = new Map(cells.map((c, i) => [c, i]));
   const avail = pieces.map((_, i) => i).filter((i) => !excludePieces.has(pieces[i].idx));
@@ -326,38 +437,66 @@ export function solveLine(scored, pieces, lineCells, excludePieces = new Set()) 
   // temperature: typical best score
   const bests = avail.map((pi) => { let b = Infinity; for (let ci = 0; ci < C; ci++) b = Math.min(b, score[pi * C + ci]); return b; });
   const tau = Math.max(2, median(bests.filter(Number.isFinite)) * 0.35);
-
   // per piece normaliser over all empty cells
   const pieceZ = new Map();
-  for (const pi of avail) {
+  avail.forEach((pi, a) => {
     let z = 0;
-    for (let ci = 0; ci < C; ci++) z += Math.exp(-(score[pi * C + ci] - bests[avail.indexOf(pi)]) / tau);
-    pieceZ.set(pi, { z, b: bests[avail.indexOf(pi)] });
-  }
-  const cand = [];
-  for (const cell of lineCells) {
-    const ci = colOf.get(cell);
-    if (ci === undefined) continue;
-    let cb = Infinity;
-    for (const pi of avail) cb = Math.min(cb, score[pi * C + ci]);
-    let cz = 0;
-    for (const pi of avail) cz += Math.exp(-(score[pi * C + ci] - cb) / tau);
-    for (const pi of avail) {
-      const s = score[pi * C + ci];
-      if (!Number.isFinite(s)) continue;
-      const { z, b } = pieceZ.get(pi);
-      const pCell = Math.exp(-(s - b) / tau) / z;
-      const pPiece = Math.exp(-(s - cb) / tau) / cz;
-      cand.push({ cell, pi, s, k: rot[pi * C + ci], conf: Math.sqrt(pCell * pPiece) });
+    for (let ci = 0; ci < C; ci++) z += Math.exp(-(score[pi * C + ci] - bests[a]) / tau);
+    pieceZ.set(pi, { z, b: bests[a] });
+  });
+
+  const todo = new Set(lineCells.filter((c) => colOf.has(c)));
+  const extra = new Map(); // cell -> Float32Array(P * 4): outline cost against pieces proposed next to it
+  const anchor = new Map(); // cell -> confidence of the proposal(s) its chained outline came from
+  const used = new Set(), out = [];
+  while (todo.size) {
+    let pick = null;
+    for (const cell of todo) {
+      const ci = colOf.get(cell), ex = extra.get(cell);
+      const vals = [];
+      let cb = Infinity;
+      for (const pi of avail) {
+        if (used.has(pi)) continue;
+        let s = score[pi * C + ci], k = rot[pi * C + ci];
+        if (ex && score4) {
+          s = Infinity;
+          for (let kk = 0; kk < 4; kk++) { const v = score4[(pi * C + ci) * 4 + kk] + ex[pi * 4 + kk]; if (v < s) { s = v; k = kk; } }
+        }
+        if (!Number.isFinite(s)) continue;
+        vals.push([pi, s, k]);
+        if (s < cb) cb = s;
+      }
+      let cz = 0;
+      for (const v of vals) cz += Math.exp(-(v[1] - cb) / tau);
+      for (const [pi, s, k] of vals) {
+        const { z, b } = pieceZ.get(pi);
+        let conf = Math.sqrt((Math.exp(-(s - b) / tau) / z) * (Math.exp(-(s - cb) / tau) / cz));
+        if (ex) conf = Math.min(conf, anchor.get(cell)); // a chain is only as sure as the proposal it hangs on
+        if (!pick || conf > pick.conf || (conf === pick.conf && s < pick.s)) pick = { cell, pi, s, k, conf };
+      }
     }
-  }
-  cand.sort((a, b) => b.conf - a.conf || a.s - b.s);
-  const usedP = new Set(), usedC = new Set(), out = [];
-  for (const c of cand) {
-    if (usedP.has(c.pi) || usedC.has(c.cell)) continue;
-    usedP.add(c.pi); usedC.add(c.cell);
-    const piece = pieces[c.pi];
-    out.push({ cell: c.cell, piece, score: c.s, confidence: c.conf, angle: piece.angle + SAMPLE_ANGLES[c.k] });
+    if (!pick) break;
+    const piece = pieces[pick.pi];
+    used.add(pick.pi); todo.delete(pick.cell);
+    out.push({ cell: pick.cell, piece, score: pick.s, confidence: pick.conf, angle: piece.angle + SAMPLE_ANGLES[pick.k] });
+    if (!cols || !piece.profiles) continue;
+    // chain: the proposed piece's sides define the holes of its neighbours in the line
+    for (let t = 0; t < 4; t++) {
+      const n = pick.cell + [-cols, 1, cols, -1][t];
+      if (!todo.has(n)) continue;
+      const dev = piece.profiles[(t + pick.k) % 4];
+      if (!dev) continue;
+      const hole = dev.map((v) => (v == null ? null : -v)).reverse(); // seen from the neighbour, clockwise around it
+      const tn = (t + 2) % 4;
+      const ex = extra.get(n) || new Float32Array(P * 4);
+      for (const pi of avail) {
+        const pr = pieces[pi].profiles;
+        if (!pr) continue;
+        for (let kk = 0; kk < 4; kk++) ex[pi * 4 + kk] += outlineCost(pr[(tn + kk) % 4], hole, outlineWeight);
+      }
+      extra.set(n, ex);
+      anchor.set(n, Math.max(anchor.get(n) || 0, pick.conf));
+    }
   }
   return out;
 }

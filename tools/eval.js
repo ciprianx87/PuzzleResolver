@@ -6,13 +6,17 @@ import { warpQuad, quadAspect, rectifiedSize } from '../js/geometry.js';
 import { segmentPieces } from '../js/segment.js';
 import { gridDescriptors, detectFilled, DETECT_INNER, describePieces, scoreAll, solveLine, cellRequirements } from '../js/match.js';
 import { homography, rectCorners } from '../js/geometry.js';
+import { homographyMap } from '../js/gridmap.js';
 import { segmentPieces as seg2 } from '../js/segment.js';
 
-export async function run(n = 10, seed0 = 1, useShape = true, noColor = false) {
-  // noColor: make every piece and cell look the same, to measure what the shape cues alone achieve
+export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, outlineWeight = undefined, chain = true, plain = false, noise = 0) {
+  // noise: random colour shift per piece (Lab units), like uneven light on a real table
+  // plain: a gradient sky instead of the colourful picture
+  // colorKeep: 1 = real colours; less fades every piece and cell towards the same grey (0 = shape cues only),
+  // to mimic look-alike regions such as a plain sky
   const tot = { filledErr: 0, cells: 0, segFound: 0, segTrue: 0, assigned: 0, correct: 0, rotOk: 0, confCorrect: 0, conf: 0 };
   for (let k = 0; k < n; k++) {
-    const d = generateDemo(seed0 + k);
+    const d = generateDemo(seed0 + k, { plain });
     const { w, h } = rectifiedSize(d.cols, d.rows, quadAspect(d.boxQuad));
     const ref = warpQuad(d.box, d.boxQuad, w, h), refLab = toLab(getImageData(ref));
     const built = warpQuad(d.built, d.builtQuad, w, h), bLab = toLab(getImageData(built));
@@ -35,18 +39,26 @@ export async function run(n = 10, seed0 = 1, useShape = true, noColor = false) {
       const mask = new Uint8Array(bs.w * bs.h);
       for (let p = 0; p < mask.length; p++) mask[p] = bs.mask[p] && !bs.looseIds.has(bs.labels[p]) ? 1 : 0;
       const filledArr = new Uint8Array(d.cols * d.rows); for (const i of d.filled) filledArr[i] = 1;
-      needs = cellRequirements(empty, d.cols, d.rows, filledArr, filledArr, { mask, w: bs.w, h: bs.h }, homography(rectCorners(d.cols, d.rows), d.builtQuad));
+      needs = cellRequirements(empty, d.cols, d.rows, filledArr, filledArr, { mask, w: bs.w, h: bs.h }, homographyMap(homography(rectCorners(d.cols, d.rows), d.builtQuad)));
     }
-    if (noColor) {
-      const flat = new Float32Array(refD[0].length).fill(50);
-      for (let i = 0; i < refD.length; i++) refD[i] = flat;
-      for (const p of seg.pieces) p.descs = p.descs.map((x) => ({ d: flat, wt: x.wt }));
+    if (noise) {
+      let st = seed0 * 7919 + k;
+      const rnd = () => { st = (st * 1103515245 + 12345) % 2147483648; return st / 2147483648 - 0.5; };
+      for (const p of seg.pieces) {
+        const off = [rnd() * 2 * noise, rnd() * noise, rnd() * noise];
+        p.descs = p.descs.map((x) => ({ d: x.d.map((v, i) => v + off[i % 3] + rnd() * noise * 0.5), wt: x.wt }));
+      }
     }
-    const scored = scoreAll(seg.pieces, refD, empty, needs);
+    if (colorKeep < 1) {
+      const fade = (d) => d.map((v, i) => { const m = i % 3 ? 0 : 50; return m + (v - m) * colorKeep; });
+      for (let i = 0; i < refD.length; i++) refD[i] = fade(refD[i]);
+      for (const p of seg.pieces) p.descs = p.descs.map((x) => ({ d: fade(x.d), wt: x.wt }));
+    }
+    const scored = scoreAll(seg.pieces, refD, empty, needs, outlineWeight);
     for (let line = 0; line < d.rows; line++) {
       const cells = empty.filter((c) => ((c / d.cols) | 0) === line);
       if (!cells.length) continue;
-      for (const m of solveLine(scored, seg.pieces, cells)) {
+      for (const m of solveLine(scored, seg.pieces, cells, new Set(), chain ? d.cols : 0)) {
         const t = cellOf(m.piece);
         tot.assigned++;
         const ok = t.cell === m.cell;
@@ -59,7 +71,7 @@ export async function run(n = 10, seed0 = 1, useShape = true, noColor = false) {
         if (m.confidence >= 0.25) { tot.conf++; if (ok) tot.confCorrect++; }
       }
     }
-    await new Promise((r) => setTimeout(r, 0));
+    await Promise.resolve(); // (no timer: background tabs throttle them)
   }
   return {
     filledAccuracy: (1 - tot.filledErr / tot.cells).toFixed(3),

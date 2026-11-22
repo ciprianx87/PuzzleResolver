@@ -1,5 +1,6 @@
 // Foreground/background segmentation and piece extraction.
 import { toLab, getImageData, otsu, median, scaleCanvas } from './imageutil.js';
+import { pieceProfiles, straighten, classify } from './outline.js';
 
 const WL = 0.5; // weight of lightness differences (shadows / uneven light)
 export const SHAPE = { rMin: 0.6, rMax: 1.6, fitDrop: 0.18, fitMin: 0.45 }; // piece plausibility limits
@@ -500,7 +501,7 @@ export function segmentPieces(canvas, sens = 1, surface = null, pieceArea = 0) {
     why.assembled = assembled.size;
     kept = kept.filter((p) => !assembled.has(p));
     kept.forEach((p, k) => (p.idx = k));
-    for (const p of kept) p.sides = sideTypes(p, labels, w, h);
+    for (const p of kept) Object.assign(p, sideShapes(p, labels, w, h));
     // everything loose (kept pieces, odd-shaped blobs, unsplit groups), as opposed to assembled sections
     for (const p of pieces) if (!assembled.has(p)) looseIds.add(p.id);
   }
@@ -513,33 +514,13 @@ export function segmentPieces(canvas, sens = 1, surface = null, pieceArea = 0) {
 }
 
 // side order in a piece's own frame: top, right, bottom, left (as unit vectors in (u, v) = (right, down))
-const SIDE_N = [[0, -1], [1, 0], [0, 1], [-1, 0]];
-
 /**
- * Shape of each side of a piece (in its own frame, at piece.angle): 'T' tab (sticks out), 'B' blank (cut in),
- * 'F' flat (border piece) or null when unclear. Checked in the middle of each side: a tab fills the band just
- * outside the core, a blank empties the band just inside it.
+ * Outline of each side of a piece (in its own frame, at piece.angle): straightened profiles (see outline.js) and
+ * the side types derived from them: 'T' tab, 'B' blank, 'F' flat (border piece) or null when unclear.
  */
-export function sideTypes(piece, labels, w, h) {
-  const s = piece.side, cos = Math.cos(piece.angle), sin = Math.sin(piece.angle);
-  const at = (U, V) => {
-    const x = Math.round(piece.cx + U * cos - V * sin), y = Math.round(piece.cy + U * sin + V * cos);
-    return x >= 0 && y >= 0 && x < w && y < h && labels[y * w + x] === piece.id;
-  };
-  return SIDE_N.map(([nu, nv]) => {
-    const tu = -nv, tv = nu; // tangent
-    let out = 0, inn = 0, n = 0;
-    for (const t of [-0.12, -0.04, 0.04, 0.12]) {
-      for (const d of [0.6, 0.66, 0.72]) if (at((nu * d + tu * t) * s, (nv * d + tv * t) * s)) out++;
-      for (const d of [0.34, 0.4, 0.46]) if (at((nu * d + tu * t) * s, (nv * d + tv * t) * s)) inn++;
-      n += 3;
-    }
-    const o = out / n, i = inn / n;
-    if (o > 0.5) return 'T';
-    if (i < 0.5) return 'B';
-    if (o < 0.15 && i > 0.8) return 'F';
-    return null;
-  });
+export function sideShapes(piece, labels, w, h) {
+  const profiles = pieceProfiles(piece, labels, w, h).map(straighten);
+  return { profiles, sides: profiles.map(classify) };
 }
 
 /** Fraction of a rotated square (side s, centre cx,cy, angle a) covered by the component `id`. */

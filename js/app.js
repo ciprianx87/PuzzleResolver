@@ -1,9 +1,10 @@
 import { loadImage, toLab, getImageData, tick } from './imageutil.js';
-import { warpQuad, quadAspect, rectifiedSize, rectCorners, homography } from './geometry.js';
+import { warpQuad, quadAspect, rectifiedSize, rectCorners, homography, invertH, applyH } from './geometry.js';
+import { homographyMap, frameMap, warpGrid } from './gridmap.js';
 import { QuadEditor } from './quadeditor.js';
 import { autoQuad, segmentPieces, dominantColor } from './segment.js';
 import {
-  gridDescriptors, shiftedGridDescriptors, detectFilled, filledFromCoverage, cellRequirements, DETECT_INNER,
+  gridDescriptors, shiftedGridDescriptors, detectFilled, filledFromCoverage, cellRequirements, completeBorderSides, borderCells, DETECT_INNER,
   describePieces, scoreAll, solveLine, solveAll,
 } from './match.js';
 import { renderSolution, renderFilled, renderPieces, matchCard, renderPreview, isLow } from './render.js';
@@ -161,21 +162,99 @@ function ensureRef() {
 function ensureBuiltRect() {
   if (cache.builtRect) return cache.builtRect;
   if (!state.img.built || !state.quad.built) throw new Error('Take the photo of the built puzzle first');
-  const ref = ensureRef();
-  const canvas = warpQuad(state.img.built, state.quad.built, ref.w, ref.h);
-  const lab = toLab(getImageData(canvas));
-  cache.builtRect = { canvas, centre: shiftedGridDescriptors(lab, ref.w, ref.h, state.cols, state.rows, DETECT_INNER) };
+  const ref = ensureRef(), { cols, rows } = state;
+  const H = homography(rectCorners(cols, rows), state.quad.built);
+  const b = { map: homographyMap(H), sides: null, traced: 0 };
   // structural detection: what is assembled puzzle (not cloth, not loose pieces) in the built photo?
   const surf = surfaceColor(state.img.built, state.quad.built);
   if (surf) {
-    const q = state.quad.built, d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-    const cellW = (d(q[0], q[1]) + d(q[3], q[2])) / 2 / state.cols, cellH = (d(q[0], q[3]) + d(q[1], q[2])) / 2 / state.rows;
+    const q = state.quad.built, d = (a, c) => Math.hypot(a.x - c.x, a.y - c.y);
+    const cellW = (d(q[0], q[1]) + d(q[3], q[2])) / 2 / cols, cellH = (d(q[0], q[3]) + d(q[1], q[2])) / 2 / rows;
     const seg = segmentPieces(state.img.built, 1, surf, cellW * cellH * 1.1);
-    const asm = new Uint8Array(seg.w * seg.h);
-    for (let p = 0; p < asm.length; p++) asm[p] = seg.mask[p] && !seg.looseIds.has(seg.labels[p]) ? 1 : 0;
-    cache.builtRect.assembled = { mask: asm, w: seg.w, h: seg.h };
+    b.assembled = { mask: assembledMask(seg, H, Math.sqrt(cellW * cellH)), w: seg.w, h: seg.h };
+    b.seg = { labels: seg.labels, mask: seg.mask, looseIds: seg.looseIds, w: seg.w, h: seg.h };
+    b.foreground = { mask: seg.mask, w: seg.w, h: seg.h };
+    // a border side assembled from corner to corner is complete (judged on everything that isn't cloth: loose
+    // pieces piled against the frame can make parts of it look loose); its traced outer edge then shapes the grid
+    b.sides = completeBorderSides(b.foreground, H, cols, rows);
+    const fm = frameMap(b.foreground, H, cols, rows, b.sides);
+    b.map = fm.map; b.traced = fm.traced;
   }
-  return cache.builtRect;
+  b.canvas = b.traced ? warpGrid(state.img.built, b.map, cols, rows, ref.w, ref.h) : warpQuad(state.img.built, state.quad.built, ref.w, ref.h);
+  const lab = toLab(getImageData(b.canvas));
+  b.centre = shiftedGridDescriptors(lab, ref.w, ref.h, cols, rows, DETECT_INNER);
+  cache.builtRect = b;
+  return b;
+}
+
+/**
+ * Mask of the assembled puzzle in the built photo: everything that isn't cloth, minus the loose pieces. In a far
+ * away photo the seams between assembled pieces look like cloth, so parts of the assembled border come apart into
+ * piece-sized blobs that look loose. Those are taken back: a piece lined up with the grid (within a few degrees)
+ * that touches the assembled part is assembled too. Loose pieces lie at random angles.
+ */
+function assembledMask(seg, H, cellPx) {
+  const { w, h, labels, mask, looseIds } = seg;
+  const asm = new Uint8Array(w * h);
+  for (let p = 0; p < asm.length; p++) asm[p] = mask[p] && !looseIds.has(labels[p]) ? 1 : 0;
+  const Hi = invertH(H);
+  const gridAngle = (x, y) => {
+    const g = applyH(Hi, x, y), a = applyH(H, g.x, g.y), b = applyH(H, g.x + 1, g.y);
+    return Math.atan2(b.y - a.y, b.x - a.x);
+  };
+  const angDiff = (a, b) => { const d = (((a - b) * 180) / Math.PI) % 90; return Math.abs(((d + 135) % 90) - 45); };
+  let cand = seg.pieces.filter((p) => angDiff(p.angle, gridAngle(p.cx, p.cy)) < 6);
+  const gap = Math.max(2, Math.round(cellPx * 0.08));
+  const touches = (p) => {
+    const { x0, y0, x1, y1 } = p.bbox;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      if (labels[y * w + x] !== p.id) continue;
+      for (let dy = -gap; dy <= gap; dy += gap) for (let dx = -gap; dx <= gap; dx += gap) {
+        const X = x + dx, Y = y + dy;
+        if (X >= 0 && Y >= 0 && X < w && Y < h && asm[Y * w + X]) return true;
+      }
+    }
+    return false;
+  };
+  for (let grew = true; grew && cand.length;) {
+    grew = false;
+    const rest = [];
+    for (const p of cand) {
+      if (!touches(p)) { rest.push(p); continue; }
+      const { x0, y0, x1, y1 } = p.bbox;
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (labels[y * w + x] === p.id) asm[y * w + x] = 1;
+      grew = true;
+    }
+    cand = rest;
+  }
+  return asm;
+}
+
+/**
+ * Mask of the assembled puzzle for measuring the holes' outlines: the assembled mask plus any "loose" blob whose
+ * centre lies in a filled cell (a chunk of the frame that came apart in the mask). Blobs lying in empty cells stay
+ * out: those really are loose pieces resting where the hole is.
+ */
+function holeMask(b, filled) {
+  const { labels, mask, looseIds, w, h } = b.seg, { cols, rows } = state;
+  const sx = new Map(), sy = new Map(), n = new Map();
+  for (let p = 0; p < w * h; p++) {
+    if (!mask[p] || !looseIds.has(labels[p])) continue;
+    const id = labels[p];
+    sx.set(id, (sx.get(id) || 0) + (p % w)); sy.set(id, (sy.get(id) || 0) + ((p / w) | 0)); n.set(id, (n.get(id) || 0) + 1);
+  }
+  const centres = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) centres.push(b.map(c + 0.5, r + 0.5));
+  const keep = new Set();
+  for (const [id, k] of n) {
+    const x = sx.get(id) / k, y = sy.get(id) / k;
+    let best = -1, bd = Infinity;
+    centres.forEach(([cx, cy], i) => { const d = (cx - x) ** 2 + (cy - y) ** 2; if (d < bd) { bd = d; best = i; } });
+    if (best >= 0 && filled[best]) keep.add(id);
+  }
+  const out = b.assembled.mask.slice();
+  for (let p = 0; p < w * h; p++) if (mask[p] && keep.has(labels[p])) out[p] = 1;
+  return { mask: out, w, h };
 }
 
 /** Colour of the surface the puzzle lies on: the most common colour outside the puzzle's corners. */
@@ -238,8 +317,10 @@ function ensureFilled() {
   if (!cache.filledAuto || cache.filledAuto.length !== state.cols * state.rows) {
     const ref = ensureRef(), b = ensureBuiltRect();
     if (b.assembled) {
-      const H = homography(rectCorners(state.cols, state.rows), state.quad.built);
-      cache.filledAuto = filledFromCoverage(b.assembled.mask, b.assembled.w, b.assembled.h, H, state.cols, state.rows).filled;
+      cache.filledAuto = filledFromCoverage(b.assembled.mask, b.assembled.w, b.assembled.h, b.map, state.cols, state.rows).filled;
+      // complete border sides are filled, even where the mask lost a piece that looks like the cloth
+      for (const i of borderCells(b.sides, state.cols, state.rows)) cache.filledAuto[i] = 1;
+      b.holeMask = holeMask(b, cache.filledAuto);
     } else {
       cache.filledAuto = detectFilled(b.centre, ref.centre).filled;
     }
@@ -316,9 +397,8 @@ async function ensureScored() {
   const ref = ensureRef();
   const empty = emptyCells();
   await progress(`Comparing ${pieces.length} pieces with ${empty.length} empty cells…`);
-  const b = cache.builtRect;
-  const H = homography(rectCorners(state.cols, state.rows), state.quad.built);
-  const needs = cellRequirements(empty, state.cols, state.rows, state.filled, cache.filledAuto, b && b.assembled, H);
+  const b = ensureBuiltRect();
+  const needs = cellRequirements(empty, state.cols, state.rows, state.filled, cache.filledAuto, b.holeMask || b.assembled, b.map);
   cache.scored = scoreAll(pieces, ref.descs, empty, needs);
   return cache.scored;
 }
@@ -552,18 +632,18 @@ function drawSolve() {
   $('#mode-row').classList.toggle('active', state.mode === 'row');
   $('#mode-col').classList.toggle('active', state.mode === 'col');
   const placed = placedPieceIdx();
-  const matches = cells.length ? solveLine(scored, pieces, cells, placed) : [];
+  const matches = cells.length ? solveLine(scored, pieces, cells, placed, state.cols) : [];
   lastMatches = matches;
   const shots = shotsMap();
   renderSolution($('#solve-canvas'), {
-    built: state.img.built, builtQuad: state.quad.built, cols: state.cols, rows: state.rows,
+    built: state.img.built, builtQuad: state.quad.built, gridToPx: ensureBuiltRect().map, cols: state.cols, rows: state.rows,
     shots, matches, lineCells: cells,
   });
   const avail = pieces.length - placed.size;
   const allDone = state.filled.every((v) => v);
   $('#solve-info').textContent = allDone ? 'Every cell is filled. The puzzle is complete! 🎉'
     : avail <= 0 ? 'All loose pieces in the photos are placed. Add a photo of the remaining pieces (step 3).'
-    : !cells.length ? `${name} ${state.line + 1} is complete. Use ▶ to go to the next line.`
+    : !cells.length ? `${name} ${state.line + 1} is complete. Use ▶ to go to the next unfinished line.`
     : `${cells.length} empty cell(s) in this ${name.toLowerCase()}, ${avail} loose piece(s). ` +
       `The arrow on each piece points to its top edge. Dashed arrows are uncertain guesses.`;
   const list = $('#match-list');
@@ -574,8 +654,17 @@ function drawSolve() {
 
 $('#mode-row').addEventListener('click', () => { state.mode = 'row'; state.line = firstOpenLine(); if (cache.scored) drawSolve(); });
 $('#mode-col').addEventListener('click', () => { state.mode = 'col'; state.line = firstOpenLine(); if (cache.scored) drawSolve(); });
-$('#line-prev').addEventListener('click', () => { state.line = (state.line - 1 + lineCount()) % lineCount(); if (cache.scored) drawSolve(); });
-$('#line-next').addEventListener('click', () => { state.line = (state.line + 1) % lineCount(); if (cache.scored) drawSolve(); });
+/** The next line in direction dir (+1 / -1) that still has empty cells (or simply the next one if none has). */
+function stepLine(dir) {
+  const n = lineCount();
+  for (let k = 1; k <= n; k++) {
+    const l = (state.line + dir * k + n * k) % n;
+    if (lineCells(state.mode, l).length) return l;
+  }
+  return (state.line + dir + n) % n;
+}
+$('#line-prev').addEventListener('click', () => { state.line = stepLine(-1); if (cache.scored) drawSolve(); });
+$('#line-next').addEventListener('click', () => { state.line = stepLine(1); if (cache.scored) drawSolve(); });
 $('#btn-placed').addEventListener('click', async () => {
   if (!lastMatches.length) return;
   for (const m of lastMatches) {
