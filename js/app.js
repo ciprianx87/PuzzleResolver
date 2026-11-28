@@ -10,6 +10,8 @@ import {
 import { renderSolution, renderFilled, renderPieces, matchCard, renderPreview, isLow } from './render.js';
 import * as store from './store.js';
 import { generateDemo } from './demo.js';
+import { boxModel, templateScores, clothColour } from './template.js';
+import { growSolve } from './grow.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -37,6 +39,8 @@ const state = {
   overrides: {},      // cell index -> 0/1, set by the user (taps, "I placed these")
   placedPts: [],      // [{shot, u, v, cell, angle}] normalised centres of loose pieces the user placed, and where
   sens: 1,
+  gray: false,                      // grey-scale matching: shapes and lines continuing from nearby pieces
+  grow: false,                      // grow outwards from the assembled pieces, piece by piece (with backtracking)
 };
 let cache = {};
 const newId = () => 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -63,9 +67,9 @@ const normQuad = (q, c) => (q && c ? q.map((p) => ({ u: p.x / c.width, v: p.y / 
 const denormQuad = (q, c) => (q && c ? q.map((p) => ({ x: p.u * c.width, y: p.v * c.height })) : null);
 
 function saveState() {
-  const { cols, rows, count, sens, overrides, placedPts, boxOriented, curShot } = state;
+  const { cols, rows, count, sens, overrides, placedPts, boxOriented, curShot, gray, grow } = state;
   store.put('state', {
-    version: STATE_VERSION, cols, rows, count, sens, overrides, placedPts, boxOriented, curShot,
+    version: STATE_VERSION, cols, rows, count, sens, overrides, placedPts, boxOriented, curShot, gray, grow,
     shotIds: state.shots.map((s) => s.id),
     quad: { box: normQuad(state.quad.box, state.img.box), built: normQuad(state.quad.built, state.img.built) },
   });
@@ -110,7 +114,7 @@ async function restore() {
   if (!s) return false;
   Object.assign(state, {
     cols: s.cols ?? state.cols, rows: s.rows ?? state.rows, count: s.count ?? state.count, sens: s.sens ?? 1,
-    boxOriented: !!s.boxOriented,
+    boxOriented: !!s.boxOriented, gray: !!s.gray, grow: !!s.grow,
   });
   state.curShot = state.shots.some((x) => x.id === s.curShot) ? s.curShot : state.shots[0]?.id ?? null;
   if ((s.version || 1) >= 2) {
@@ -128,13 +132,13 @@ async function restore() {
 // ---------------------------------------------------------------- invalidation
 function invalidate(what) {
   const deps = {
-    box: ['ref', 'builtRect', 'filled', 'scored'],
-    grid: ['ref', 'builtRect', 'filled', 'scored'],
-    built: ['builtRect', 'filled', 'scored'],
+    box: ['ref', 'builtRect', 'filled', 'boxModel', 'scored'],
+    grid: ['ref', 'builtRect', 'filled', 'boxModel', 'scored'],
+    built: ['builtRect', 'filled', 'boxModel', 'scored'],
     pieces: ['segs', 'pieces', 'scored'],   // all pieces photos (e.g. sensitivity changed)
     shots: ['pieces', 'scored'],            // a photo was added/removed: keep the others' results
     filled: ['scored'],
-  }[what] || ['ref', 'builtRect', 'filled', 'segs', 'pieces', 'scored'];
+  }[what] || ['ref', 'builtRect', 'filled', 'boxModel', 'segs', 'pieces', 'scored'];
   for (const d of deps) {
     if (d === 'filled') { state.filled = null; delete cache.filledAuto; }
     else delete cache[d];
@@ -401,7 +405,7 @@ async function ensureScored() {
   if (cache.scored) return cache.scored;
   const pieces = await ensurePieces();
   const ref = ensureRef();
-  const empty = emptyCells();
+  let empty = emptyCells();
   await progress(`Comparing ${pieces.length} pieces with ${empty.length} empty cells…`);
   const b = ensureBuiltRect();
   const hm = b.holeMask || b.assembled;
@@ -409,8 +413,22 @@ async function ensureScored() {
   // compare pieces with the box picture as it looks photographed on the table (learned from the assembled cells)
   const assembledCells = [];
   for (let i = 0; i < cache.filledAuto.length; i++) if (cache.filledAuto[i]) assembledCells.push(i);
+  // grey-scale mode works from the assembled puzzle outwards: only the gaps next to assembled pieces, where the
+  // shape of the hole and the lines of the neighbours tell where a piece goes
+  if (state.gray && !state.grow && needs) { // (growing reaches further gaps itself)
+    const front = empty.filter((c) => { const n = needs.get(c); return n && n.line && n.line.some(Boolean); });
+    if (front.length >= Math.min(pieces.length, 10)) empty = front;
+  }
   const cal = photoCalibration(ref.descs, b.descs, assembledCells);
-  cache.scored = scoreAll(pieces, cal ? ref.descs.map(cal) : ref.descs, empty, needs);
+  // the picture term: each piece's template slid over the box picture, bent onto the puzzle (see template.js)
+  if (!cache.boxModel) {
+    await progress('Lining up the box picture with your puzzle…');
+    cache.boxModel = boxModel(ref.canvas, b.canvas, assembledCells, state.cols, state.rows);
+  }
+  const refCloth = b.lab && b.seg ? clothColour(b.lab, b.seg.labels, b.seg.w, b.seg.h) : null;
+  const appear = await templateScores(pieces, cache.boxModel, empty, refCloth,
+    (i, n) => progress(`Comparing pieces with the box picture: ${i} of ${n}…`), state.gray);
+  cache.scored = scoreAll(pieces, cal ? ref.descs.map(cal) : ref.descs, empty, needs, undefined, undefined, appear);
   return cache.scored;
 }
 
@@ -438,7 +456,7 @@ function showEditor(key) {
 
 // ---------------------------------------------------------------- grid settings
 const elCount = $('#piece-count'), elCols = $('#grid-cols'), elRows = $('#grid-rows');
-function syncGridInputs() { elCount.value = state.count; elCols.value = state.cols; elRows.value = state.rows; }
+function syncGridInputs() { elCount.value = state.count; elCols.value = state.cols; elRows.value = state.rows; $('#solve-gray').checked = !!state.gray; $('#solve-grow').checked = !!state.grow; }
 function gridFromCount() {
   const q = state.quad.built || state.quad.box;
   const aspect = q ? quadAspect(q) : 4 / 3;
@@ -625,9 +643,12 @@ async function showSolve() {
 
 /** Best spot for every loose piece not marked as placed yet, most confident first. */
 function pieceSpots() {
-  if (!cache.spots || cache.spotsFor !== cache.scored) {
-    cache.spots = solveAll(cache.scored, cache.pieces, placedPieceIdx()).sort((a, b) => b.confidence - a.confidence);
-    cache.spotsFor = cache.scored;
+  if (!cache.spots || cache.spotsFor !== cache.scored || cache.spotsGrow !== state.grow) {
+    // growing: in the order the pieces were proposed (each may lean on the ones before it)
+    cache.spots = state.grow
+      ? growSolve(cache.scored, cache.pieces, state.cols, state.rows, state.filled, placedPieceIdx())
+      : solveAll(cache.scored, cache.pieces, placedPieceIdx()).sort((a, b) => b.confidence - a.confidence);
+    cache.spotsFor = cache.scored; cache.spotsGrow = state.grow;
   }
   return cache.spots;
 }
@@ -667,6 +688,20 @@ function drawSolve() {
 }
 
 $('#solve-guesses').addEventListener('change', () => { solvePage = 0; if (cache.scored) drawSolve(); });
+$('#solve-grow').addEventListener('change', async (e) => {
+  state.grow = e.target.checked;
+  saveState();
+  solvePage = 0;
+  if (state.gray) delete cache.scored; // grey mode scores a different set of gaps when growing
+  await showSolve();
+});
+$('#solve-gray').addEventListener('change', async (e) => {
+  state.gray = e.target.checked;
+  saveState();
+  solvePage = 0;
+  delete cache.scored;
+  await showSolve();
+});
 $('#page-prev').addEventListener('click', () => { solvePage--; if (cache.scored) drawSolve(); });
 $('#page-next').addEventListener('click', () => { solvePage++; if (cache.scored) drawSolve(); });
 $('#btn-placed').addEventListener('click', async () => {

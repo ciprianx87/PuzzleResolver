@@ -21,7 +21,7 @@ Open the site on your phone (see *Hosting* below) and go through the four tabs:
 | **1 · Box** | Take or pick a photo of the box picture and drag the 4 corners onto the picture's corners. A sideways or upside-down photo is fine: the app turns it to match your puzzle (or use **↻ Rotate picture**). Enter the number of pieces. The app estimates columns × rows; correct them if needed by counting the pieces along one edge. |
 | **2 · Built** | Photograph the puzzle from straight above and drag the corners to where the corners of the *finished* puzzle will be. Check that the grid lines follow the seams between pieces. Cells covered by the assembled puzzle are marked in green; loose pieces lying on the cloth are not counted. Tap a cell to fix a mistake. |
 | **3 · Pieces** | Spread pieces face up on a plain cloth or board and photograph them from above. Add as many photos as you need, each of a different part of the cloth. Floor, chairs or the box at the edges are ignored. Detected pieces are outlined; red marks groups of touching pieces, which are skipped. Use the sensitivity slider if the outlines are off. |
-| **4 · Solve** | Shows where the loose pieces in your photos go, ten at a time, most confident first. Coloured arrows go from each piece to its cell; ◀ ▶ shows the next ten. Pieces the app isn't sure about are left out unless you tick **Show guesses too**. After placing the pieces, tap **✓ I placed these** to move on without retaking photos. |
+| **4 · Solve** | Shows where the loose pieces in your photos go, ten at a time, most confident first. Coloured arrows go from each piece to its cell; ◀ ▶ shows the next ten. Pieces the app isn't sure about are left out unless you tick **Show guesses too**. After placing the pieces, tap **✓ I placed these** to move on without retaking photos. **Grey scale: shapes & lines from nearby pieces** is a second method that ignores colours and light: it only fills the gaps next to the assembled puzzle, using the piece shapes, the lines that continue from the neighbouring pieces and the box picture in grey. **Grow from my assembled pieces** fills the gaps next to your assembled pieces one at a time, at every rotation, and each proposed piece must also fit the next ones (tabs and blanks, outlines, lines across the seam). It keeps several alternatives (backtracking) and lists the pieces in the order to place them; a piece is never shown as surer than the proposed pieces it leans on. |
 
 **👁 Preview** (on the Pieces and Solve steps) places *every* loose piece in the photo at once and shows what the
 puzzle would look like. Each piece is cut out of your photo, turned upright and drawn in its best cell, tabs
@@ -64,16 +64,21 @@ Photos stay on the device and browser where they were taken. **Reset** clears ev
   Groups of touching pieces are split at their narrow necks using distance-transform seeds. Blobs without a
   piece-like square core, and pieces sitting edge to edge on a grid (an assembled row in the photo), are
   dropped.
-- **Piece pose**: the orientation (mod 90°) comes from a histogram of outline normals, refined by maximising the
-  edge sharpness of the projection profiles. The centre and size of the square core come from the width
-  profiles; the narrow tabs drop out.
-- **Matching**: each piece's core is described at 4 rotations and scored against every empty cell. The piece
-  colours are first calibrated, per photo, against the still-empty part of the box picture. Piece shape adds a
-  penalty when it contradicts a cell. Each side is classified as tab, blank or flat: border cells need flat
-  sides and interior cells must not have them. Next to an assembled piece, the built photo shows whether its tab
-  pokes into the gap, so the new piece needs a blank there, or a tab otherwise. Each side's outline is also
-  compared with the hole the assembled neighbours leave. Before comparing, the box picture is mapped to how it
-  looks photographed on the table, using the cells already assembled in the built photo.
+- **Piece pose**: the orientation (mod 90°) is where the mask's projection profiles have the sharpest steps
+  (the straight core edges line up with the axes), searched over the full 0–90° range with anti-aliased profiles.
+  The centre and size of the square core come from the width profiles; the narrow tabs drop out.
+- **Matching the picture**: each piece is cut out of its photo, core plus tabs, with the cloth that shows through
+  its blanks masked out, and slid over the box picture around every empty cell (masked normalised
+  cross-correlation per Lab channel, coarse pass over all cells, then a finer pass over the best 30). This compares
+  the structure of the picture and ignores brightness and contrast, which differ a lot between the box print and
+  the pieces on the table. Before that, the box picture is bent onto the puzzle with a smooth shift field measured
+  on the assembled cells (a box lid is never flat; shifts of half a cell are normal). A calibrated colour term and a
+  contrast term (a striped piece doesn't belong in plain sky) are added, box areas covered by a sticker or
+  starburst are left out, and cells that resemble every piece are corrected for (hub correction).
+- **Shape**: each side is classified as tab, blank or flat: border cells need flat sides and interior cells must
+  not have them. Next to an assembled piece, the built photo shows whether its tab pokes into the gap, so the new
+  piece needs a blank there, or a tab otherwise. Each side's outline is also compared with the hole the assembled
+  neighbours leave, and the colours along it with the neighbour's edge.
 - **Placement**: all loose pieces are assigned to the empty cells at once with the Hungarian algorithm (minimum
   total distance, one piece per cell). Each placement gets a two-way softmax confidence (how much better this cell
   is than others for the piece, and this piece than others for the cell). Solve and Preview show only confident
@@ -87,6 +92,8 @@ js/app.js         UI flow, state, persistence
 js/geometry.js    homography + perspective warp
 js/segment.js     background model, piece mask, pose estimation
 js/match.js       descriptors, filled detection, scoring, assignment
+js/template.js    picture matching: box shift field, piece templates, masked correlation
+js/grow.js        growing outwards from the assembled pieces (beam search with piece-to-piece fit)
 js/render.js      overlay with arrows, match cards
 js/quadeditor.js  draggable corner editor with magnifier
 js/demo.js        synthetic puzzle generator
@@ -113,9 +120,11 @@ content fingerprint into `index.html`, so a phone that cached an older version n
 
 ## Limitations
 
-- Areas of one uniform colour (a plain sky, for example) can't be told apart by colour, and the tab/blank cues
-  only narrow them down somewhat. Expect low confidence there. Matching the exact outline of each piece against
-  its neighbours would be the next step.
+- Areas of one uniform colour (a plain sky, pale water) can't be told apart by the picture; only the shape cues
+  next to assembled pieces narrow them down. Expect those pieces to stay unsure.
+- A box photo with a crease, glare or an inset picture printed over part of it misleads the matching there. Take
+  the box photo flat, without glare, filling the frame.
+- Pieces lying against each other are split apart, but their outlines are less exact: keep them apart.
 - A piece photographed twice (overlapping photos) is treated as two pieces.
 - Corners found by *Auto corners* are a starting point. Check them, especially on a box photo.
 

@@ -34,18 +34,20 @@
   <script type="importmap">
   {
     "imports": {
-      "./js/app.js": "./js/app.js?v=8afa003f67",
+      "./js/app.js": "./js/app.js?v=e1b3d3ee3f",
       "./js/demo.js": "./js/demo.js?v=ec1031d1f6",
-      "./js/edges.js": "./js/edges.js?v=6c8a25e741",
+      "./js/edges.js": "./js/edges.js?v=ba1dd3b344",
       "./js/geometry.js": "./js/geometry.js?v=da8e4e7111",
       "./js/gridmap.js": "./js/gridmap.js?v=416ca0cd24",
+      "./js/grow.js": "./js/grow.js?v=5dd8baadd1",
       "./js/imageutil.js": "./js/imageutil.js?v=6311675266",
-      "./js/match.js": "./js/match.js?v=cefc3f9a4b",
+      "./js/match.js": "./js/match.js?v=f93e8a9669",
       "./js/outline.js": "./js/outline.js?v=b0e4727dde",
       "./js/quadeditor.js": "./js/quadeditor.js?v=0f32f751db",
       "./js/render.js": "./js/render.js?v=593e6cc097",
-      "./js/segment.js": "./js/segment.js?v=15cc4ec858",
-      "./js/store.js": "./js/store.js?v=b17b2ca5ff"
+      "./js/segment.js": "./js/segment.js?v=50bf9aa5e6",
+      "./js/store.js": "./js/store.js?v=b17b2ca5ff",
+      "./js/template.js": "./js/template.js?v=71733c6533"
     }
   }
   </script>
@@ -139,6 +141,8 @@
       <h2>Where your loose pieces go</h2>
       <div class="solve-controls">
         <label class="check"><input type="checkbox" id="solve-guesses"> Show guesses too</label>
+        <label class="check" title="Ignores colours and the light: matches the picture in grey scale and puts more weight on the piece shapes and on lines that continue from the assembled pieces next to each gap"><input type="checkbox" id="solve-gray"> Grey scale: shapes &amp; lines from nearby pieces</label>
+        <label class="check" title="Fills the gaps next to your assembled pieces one at a time, trying every rotation; each proposed piece must also fit the next ones (tabs, outline, lines). Keeps several alternatives and drops the ones that stop fitting."><input type="checkbox" id="solve-grow"> Grow from my assembled pieces</label>
         <div class="line-picker">
           <button id="page-prev" class="small" aria-label="Previous pieces">◀</button>
           <span id="page-label">Pieces 1–10</span>
@@ -179,6 +183,6 @@
   <div id="busy" class="busy" hidden><div class="spinner"></div><div id="busy-text">Working…</div></div>
   <div id="toast" class="toast" hidden></div>
 
-  <script type="module" src="js/app.js?v=8afa003f67"></script>
+  <script type="module" src="js/app.js?v=e1b3d3ee3f"></script>
 </body>
 </html>

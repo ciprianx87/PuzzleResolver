@@ -1,8 +1,9 @@
 // Appearance descriptors and matching of pieces to puzzle cells.
 import { sample3, otsu, median } from './imageutil.js';
 import { invertH } from './geometry.js';
-import { pieceEdges, neighbourEdge, edgeDist, edgeStats, calibEdge } from './edges.js';
+import { pieceEdges, neighbourEdge, edgeDist, edgeStats, calibEdge, pieceLines, neighbourLines, lineScore } from './edges.js';
 import { PROFILE_T, PROFILE_D, coverToEdge, straighten, classify, profileDist } from './outline.js';
+import { pieceTemplates, clothColour } from './template.js';
 
 export const N = 8;          // descriptor grid is N x N
 const INNER = 0.84;          // fraction of the cell/core that is sampled
@@ -289,17 +290,20 @@ export function cellRequirements(emptyCells, cols, rows, filled, photoFilled, as
   for (const cell of emptyCells) {
     const c = cell % cols, r = (cell / cols) | 0;
     const nb = [r > 0 ? cell - cols : -1, c < cols - 1 ? cell + 1 : -1, r < rows - 1 ? cell + cols : -1, c > 0 ? cell - 1 : -1];
-    const prof = [null, null, null, null], edge = [null, null, null, null];
+    const prof = [null, null, null, null], edge = [null, null, null, null], line = [null, null, null, null];
     const need = nb.map((n, t) => {
       if (n < 0) return 'F';
       if (!filled[n]) return 'N';
       if (!assembled || !photoFilled || !photoFilled[n]) return 'N'; // placed later: shape unknown
       prof[t] = holeProfile(assembled, toPx, c, r, t);
-      if (assembled.lab) edge[t] = neighbourEdge(assembled.lab, assembled.mask, assembled.w, assembled.h, toPx, c, r, t);
+      if (assembled.lab) {
+        edge[t] = neighbourEdge(assembled.lab, assembled.mask, assembled.w, assembled.h, toPx, c, r, t);
+        line[t] = neighbourLines(assembled.lab, assembled.mask, assembled.w, assembled.h, toPx, c, r, t);
+      }
       const k = classify(prof[t]);
       return k === 'F' ? 'N' : k; // a neighbour inside the puzzle never leaves a straight edge
     });
-    need.prof = prof; need.edge = edge;
+    need.prof = prof; need.edge = edge; need.line = line;
     out.set(cell, need);
   }
   return out;
@@ -411,9 +415,13 @@ const SAMPLE_ANGLES = [0, 1, 2, 3].map((k) => (k * Math.PI) / 2);
 /** Compute descriptors of each piece at its 4 possible orientations. */
 export function describePieces(seg) {
   const { lab, labels, w, h, pieces } = seg;
+  const cloth = clothColour(lab, labels, w, h);
   for (const p of pieces) {
     p.descs = SAMPLE_ANGLES.map((a) => pieceDescriptor(lab, labels, w, h, p, p.angle + a));
     p.edges = pieceEdges(lab, labels, w, h, p);
+    p.lines = pieceLines(lab, labels, w, h, p);
+    p.templates = pieceTemplates(lab, labels, w, h, p);
+    p.cloth = cloth;
   }
   seg.lab = null; // not needed any more; can be ~50 MB per photo
 }
@@ -441,9 +449,20 @@ function sideMismatch(have, need) {
 
 /** Score per unit of colour mismatch (Lab) with the strip inside an assembled neighbour's edge (see edges.js). */
 export const EDGE_WEIGHT = 0.25;
+/**
+ * Picture term from template correlation (template.js): cost = APPEAR_W * (APPEAR_OFF - score). A score difference
+ * of 0.1 is worth about one side of contradicting shape.
+ */
+export const APPEAR_W = 80, APPEAR_OFF = 0.6;
+/**
+ * Grey-scale mode (appear.gray): score per unit of line continuation (see lineScore in edges.js) on each side next
+ * to an assembled piece, and the factor on the shape terms. Colours along the neighbours' edges are not used.
+ */
+export const LINE_W = 25, GRAY_SHAPE = 1.5;
 
-export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outlineWeight = OUTLINE_WEIGHT, edgeWeight = EDGE_WEIGHT) {
+export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outlineWeight = OUTLINE_WEIGHT, edgeWeight = EDGE_WEIGHT, appear = null) {
   // cellNeeds (optional): Map cell -> [top, right, bottom, left] side requirements (see sideMismatch)
+  // appear (optional): { s4 } from templateScores; replaces the colour descriptors as the picture term
   // calibrate the pieces' colours against the region that is still empty: those are the same picture parts.
   // Done per photo, since each photo has its own lighting and white balance.
   const rStats = channelStats(emptyCells.map((c) => refDescs[c]));
@@ -460,7 +479,9 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outline
   }
   const P = pieces.length, C = emptyCells.length;
   const score = new Float32Array(P * C), rot = new Uint8Array(P * C), score4 = new Float32Array(P * C * 4);
-  const edgeCost = neighbourColourCosts(pieces, emptyCells, cellNeeds, byShot, edgeWeight);
+  const gray = !!(appear && appear.gray);
+  const edgeCost = gray ? lineCosts(pieces, emptyCells, cellNeeds) : neighbourColourCosts(pieces, emptyCells, cellNeeds, byShot, edgeWeight);
+  const shapeF = gray ? GRAY_SHAPE : 1;
   pieces.forEach((p, pi) => {
     const cal = cals.get(p.shot ?? 0);
     const cd = p.descs.map((x) => applyCalib(x.d, cal));
@@ -469,15 +490,15 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outline
       const need = cellNeeds && cellNeeds.get(emptyCells[ci]);
       let best = Infinity, bk = 0;
       for (let k = 0; k < 4; k++) {
-        let v = descDist(cd[k], ref, p.descs[k].wt);
+        let v = appear ? APPEAR_W * (APPEAR_OFF - appear.s4[(pi * C + ci) * 4 + k]) : descDist(cd[k], ref, p.descs[k].wt);
         if (need && p.sides) {
           // at rotation k the cell's side t is the piece's own side (t + k) % 4
           let m = 0;
           for (let t = 0; t < 4; t++) m += sideMismatch(p.sides[(t + k) % 4], need[t]);
-          v += m * SHAPE_PENALTY;
+          v += m * SHAPE_PENALTY * shapeF;
           if (need.prof && p.profiles) {
             // (centred, so cells next to assembled pieces are not less attractive than cells without outlines)
-            for (let t = 0; t < 4; t++) if (need.prof[t]) v += outlineCost(p.profiles[(t + k) % 4], need.prof[t], outlineWeight);
+            for (let t = 0; t < 4; t++) if (need.prof[t]) v += shapeF * outlineCost(p.profiles[(t + k) % 4], need.prof[t], outlineWeight);
           }
         }
         const ec = edgeCost.get(ci);
@@ -520,6 +541,37 @@ function neighbourColourCosts(pieces, emptyCells, cellNeeds, byShot, weight) {
       if (fin.length < 4) return;
       const med = median(fin), cap = med * 2.5;
       for (let i = 0; i < d.length; i++) d[i] = Number.isFinite(d[i]) ? weight * (Math.min(cap, d[i]) - med) : 0;
+      list.push([t, d]);
+    });
+    if (list.length) out.set(ci, list);
+  });
+  return out;
+}
+
+/**
+ * Line continuation with assembled neighbours (grey scale): for each empty cell side next to an assembled piece, the
+ * cost of each piece side sitting there (same layout as neighbourColourCosts). Centred on the median over all
+ * pieces, so cells with known neighbours are not more or less attractive as such.
+ */
+function lineCosts(pieces, emptyCells, cellNeeds) {
+  const out = new Map();
+  if (!cellNeeds) return out;
+  const P = pieces.length;
+  emptyCells.forEach((cell, ci) => {
+    const need = cellNeeds.get(cell);
+    if (!need || !need.line) return;
+    const list = [];
+    need.line.forEach((hole, t) => {
+      if (!hole) return;
+      const d = new Float32Array(P * 4).fill(NaN);
+      for (let pi = 0; pi < P; pi++) {
+        const ln = pieces[pi].lines;
+        if (ln) for (let s = 0; s < 4; s++) { const v = lineScore(ln[s], hole); if (v != null) d[pi * 4 + s] = v; }
+      }
+      const fin = Array.from(d).filter(Number.isFinite);
+      if (fin.length < 4) return;
+      const med = median(fin);
+      for (let i = 0; i < d.length; i++) d[i] = Number.isFinite(d[i]) ? -LINE_W * (d[i] - med) : 0;
       list.push([t, d]);
     });
     if (list.length) out.set(ci, list);

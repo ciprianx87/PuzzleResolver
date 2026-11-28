@@ -94,3 +94,73 @@ export function calibEdge(e, cal) {
   for (let i = 0; i < c.length; i += 3) for (let ch = 0; ch < 3; ch++) c[i + ch] = e.c[i + ch] * cal[ch].gain + cal[ch].off;
   return { c, wt: e.wt };
 }
+
+// ------------------------------------------------------------------ line continuation (grey scale)
+//
+// The drawing continues across a seam: a girder, a window edge or the outline of a tower that reaches the edge of an
+// assembled piece goes on into the missing piece at the same place. Comparing only the lightness along the strip on
+// both sides of the seam, normalised (zero mean, unit spread), ignores the colour and the brightness of each photo
+// and keeps where the lines cross the edge.
+
+/** Samples along a side for line continuation. */
+export const NL = 24;
+const LT0 = -0.44, LT1 = 0.44;
+const LDEPTHS = [0.03, 0.07];          // close to the seam: the line positions must match there
+
+function lineStrip(sampler) {
+  const v = new Float32Array(NL), wt = new Float32Array(NL);
+  for (let j = 0; j < NL; j++) {
+    const t = LT0 + ((LT1 - LT0) * (j + 0.5)) / NL;
+    let s = 0, n = 0;
+    for (const d of LDEPTHS) { const x = sampler(t, d); if (x != null) { s += x; n++; } }
+    wt[j] = n / LDEPTHS.length;
+    if (n) v[j] = s / n;
+  }
+  return { v, wt };
+}
+
+/** Lightness along the strip just inside each of a piece's 4 sides (same frame and order as pieceEdges). */
+export function pieceLines(lab, labels, w, h, piece) {
+  const s = piece.side, cos = Math.cos(piece.angle), sin = Math.sin(piece.angle);
+  return SIDES.map(([nu, nv]) => lineStrip((t, d) => {
+    const U = (nu * (0.5 - d) + -nv * t) * s, V = (nv * (0.5 - d) + nu * t) * s;
+    const x = piece.cx + U * cos - V * sin, y = piece.cy + U * sin + V * cos;
+    const xi = Math.round(x), yi = Math.round(y);
+    if (xi < 0 || yi < 0 || xi >= w || yi >= h || labels[yi * w + xi] !== piece.id) return null;
+    return lab[(yi * w + xi) * 3];
+  }));
+}
+
+/** Lightness along the strip just across side t of empty cell (c, r), inside the assembled neighbour. */
+export function neighbourLines(lab, mask, w, h, toPx, c, r, t) {
+  const [nu, nv] = SIDES[t];
+  return lineStrip((tt, d) => {
+    const [x, y] = toPx(c + 0.5 + nu * (0.5 + d) - nv * tt, r + 0.5 + nv * (0.5 + d) + nu * tt);
+    const xi = Math.round(x), yi = Math.round(y);
+    if (xi < 0 || yi < 0 || xi >= w || yi >= h || mask[yi * w + xi] !== 1) return null;
+    return lab[(yi * w + xi) * 3];
+  });
+}
+
+/**
+ * How well the lines continue across a seam: normalised correlation of the two lightness profiles, best over a small
+ * slide along the edge (the grid is never exact). A plain strip on either side carries no information and scores 0.
+ * Returns a value in [-1, 1], or null when too little of the edge is visible on both sides.
+ */
+export function lineScore(a, b) {
+  let best = null;
+  for (let sh = -2; sh <= 2; sh++) {
+    let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (let j = 0; j < NL; j++) {
+      const k = j + sh;
+      if (k < 0 || k >= NL || a.wt[j] < 0.5 || b.wt[k] < 0.5) continue;
+      const x = a.v[j], y = b.v[k];
+      n++; sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
+    }
+    if (n < NL / 2) continue;
+    const va = saa - (sa * sa) / n, vb = sbb - (sb * sb) / n, floor = n * 4; // spread below 2 L units = plain
+    const v = (sab - (sa * sb) / n) / Math.sqrt(Math.max(va, floor) * Math.max(vb, floor));
+    if (best == null || v > best) best = v;
+  }
+  return best;
+}

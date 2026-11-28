@@ -579,46 +579,19 @@ function assembledPieces(pieces, side) {
 
 /**
  * Estimate the pose of a piece's square core.
- *  - orientation (mod 90 deg): histogram of outline normal directions in 4*theta space; the straight core edges
- *    dominate while the round tabs spread out evenly.
+ *  - orientation (mod 90 deg): the straight core edges give the sharpest steps in the mask's projection profiles
+ *    when they line up with the axes. Searched over the whole 0..90 deg range, with the pixels spread over two
+ *    profile bins (anti-aliased): with plain rounding the pixel grid itself makes 0 and 45 deg look sharp, and a
+ *    histogram of outline normals from small neighbourhoods snaps to a few fixed angles (atan of small ratios).
  *  - centre / size: width profiles of the mask along both piece axes; the core is where the profile is wide,
  *    tabs are narrow necks and fall below the threshold.
  */
 function refinePose(piece, labels, w, h) {
   const { id, bbox } = piece;
-  const xs = [], ys = [], bx = [], by = [];
+  const xs = [], ys = [];
   for (let y = bbox.y0; y <= bbox.y1; y++) for (let x = bbox.x0; x <= bbox.x1; x++) {
-    const p = y * w + x;
-    if (labels[p] !== id) continue;
-    xs.push(x); ys.push(y);
-    if (x === 0 || y === 0 || x === w - 1 || y === h - 1 ||
-      labels[p - 1] !== id || labels[p + 1] !== id || labels[p - w] !== id || labels[p + w] !== id) { bx.push(x); by.push(y); }
+    if (labels[y * w + x] === id) { xs.push(x); ys.push(y); }
   }
-  // outline normals: direction from the boundary pixel to the centroid of nearby inside pixels
-  const BINS = 90, hist = new Float64Array(BINS), R = 3;
-  for (let k = 0; k < bx.length; k++) {
-    let sx = 0, sy = 0;
-    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
-      const x = bx[k] + dx, y = by[k] + dy;
-      if (x < 0 || y < 0 || x >= w || y >= h || labels[y * w + x] !== id) continue;
-      sx += dx; sy += dy;
-    }
-    if (Math.hypot(sx, sy) < 1) continue;
-    let t = (Math.atan2(sy, sx) * 4) % (2 * Math.PI);
-    if (t < 0) t += 2 * Math.PI;
-    hist[Math.floor((t / (2 * Math.PI)) * BINS) % BINS] += 1;
-  }
-  const sm = new Float64Array(BINS);
-  const kern = [1, 3, 5, 3, 1];
-  for (let i = 0; i < BINS; i++) for (let j = -2; j <= 2; j++) sm[i] += hist[(i + j + BINS) % BINS] * kern[j + 2];
-  let pk = 0;
-  for (let i = 1; i < BINS; i++) if (sm[i] > sm[pk]) pk = i;
-  const l = sm[(pk - 1 + BINS) % BINS], c = sm[pk], r = sm[(pk + 1) % BINS];
-  const den = l - 2 * c + r;
-  const off = den !== 0 ? (0.5 * (l - r)) / den : 0;
-  let ang = (((pk + 0.5 + off) / BINS) * 2 * Math.PI) / 4; // in [0, pi/2)
-
-  // width profiles along the two piece axes
   const cx0 = piece.cx, cy0 = piece.cy;
   const span = Math.ceil(Math.hypot(bbox.x1 - bbox.x0, bbox.y1 - bbox.y0)) + 4;
   const pu = new Float32Array(2 * span + 1), pv = new Float32Array(2 * span + 1);
@@ -631,16 +604,29 @@ function refinePose(piece, labels, w, h) {
       pv[Math.round(-dx * sin + dy * cos) + span]++;
     }
   };
-  // refine: straight core edges aligned with the axes give the sharpest steps in the profiles
+  const su = new Float32Array(2 * span + 3), sv = new Float32Array(2 * span + 3);
   const sharp = (a) => {
-    profiles(a);
+    su.fill(0); sv.fill(0);
+    const cos = Math.cos(a), sin = Math.sin(a);
+    for (let k = 0; k < xs.length; k++) {
+      const dx = xs[k] - cx0, dy = ys[k] - cy0;
+      const u = dx * cos + dy * sin + span + 1, v = -dx * sin + dy * cos + span + 1;
+      const iu = Math.floor(u), iv = Math.floor(v), fu = u - iu, fv = v - iv;
+      su[iu] += 1 - fu; su[iu + 1] += fu; sv[iv] += 1 - fv; sv[iv + 1] += fv;
+    }
     let e = 0;
-    for (let i = 1; i < pu.length; i++) { const du = pu[i] - pu[i - 1], dv = pv[i] - pv[i - 1]; e += du * du + dv * dv; }
+    for (let i = 2; i < su.length - 1; i++) {
+      // derivative of the [1 2 1]-smoothed profile
+      const du = su[i + 1] + su[i] - su[i - 1] - su[i - 2], dv = sv[i + 1] + sv[i] - sv[i - 1] - sv[i - 2];
+      e += du * du + dv * dv;
+    }
     return e;
   };
   const D = Math.PI / 180;
-  for (const [range, step] of [[12, 1], [1, 0.2]]) {
-    let best = ang, bestE = -1;
+  let ang = 0, bestE = -1;
+  for (let d = 0; d < 90; d += 1.5) { const e = sharp(d * D); if (e > bestE) { bestE = e; ang = d * D; } }
+  for (const [range, step] of [[1.5, 0.5], [0.5, 0.1]]) {
+    let best = ang;
     for (let d = -range; d <= range + 1e-9; d += step) {
       const e = sharp(ang + d * D);
       if (e > bestE) { bestE = e; best = ang + d * D; }
