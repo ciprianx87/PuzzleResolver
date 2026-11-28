@@ -4,14 +4,19 @@ import { homographyMap, frameMap, warpGrid } from './gridmap.js';
 import { QuadEditor } from './quadeditor.js';
 import { autoQuad, segmentPieces, dominantColor } from './segment.js';
 import {
-  gridDescriptors, shiftedGridDescriptors, detectFilled, filledFromCoverage, cellRequirements, completeBorderSides, borderCells, DETECT_INNER,
-  describePieces, scoreAll, solveLine, solveAll,
+  gridDescriptors, shiftedGridDescriptors, detectFilled, filledFromCoverage, cellRequirements, photoCalibration, completeBorderSides, borderCells, DETECT_INNER,
+  describePieces, scoreAll, solveAll,
 } from './match.js';
 import { renderSolution, renderFilled, renderPieces, matchCard, renderPreview, isLow } from './render.js';
 import * as store from './store.js';
 import { generateDemo } from './demo.js';
 
 const $ = (s) => document.querySelector(s);
+
+// Resolves once the saved photos are restored. Created first, so event handlers registered below can always wait
+// on it (the restore itself runs at the very end, once every handler is in place).
+let markBooted;
+const booted = new Promise((resolve) => { markBooted = resolve; });
 // processing resolution (originals are stored untouched); pieces of a 1000-piece puzzle need the extra pixels
 const MAXDIM = { box: 1600, built: 2000, pieces: 2400 };
 
@@ -32,7 +37,6 @@ const state = {
   overrides: {},      // cell index -> 0/1, set by the user (taps, "I placed these")
   placedPts: [],      // [{shot, u, v, cell, angle}] normalised centres of loose pieces the user placed, and where
   sens: 1,
-  mode: 'row', line: -1,
 };
 let cache = {};
 const newId = () => 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -59,9 +63,9 @@ const normQuad = (q, c) => (q && c ? q.map((p) => ({ u: p.x / c.width, v: p.y / 
 const denormQuad = (q, c) => (q && c ? q.map((p) => ({ x: p.u * c.width, y: p.v * c.height })) : null);
 
 function saveState() {
-  const { cols, rows, count, sens, overrides, placedPts, mode, line, boxOriented, curShot } = state;
+  const { cols, rows, count, sens, overrides, placedPts, boxOriented, curShot } = state;
   store.put('state', {
-    version: STATE_VERSION, cols, rows, count, sens, overrides, placedPts, mode, line, boxOriented, curShot,
+    version: STATE_VERSION, cols, rows, count, sens, overrides, placedPts, boxOriented, curShot,
     shotIds: state.shots.map((s) => s.id),
     quad: { box: normQuad(state.quad.box, state.img.box), built: normQuad(state.quad.built, state.img.built) },
   });
@@ -106,7 +110,7 @@ async function restore() {
   if (!s) return false;
   Object.assign(state, {
     cols: s.cols ?? state.cols, rows: s.rows ?? state.rows, count: s.count ?? state.count, sens: s.sens ?? 1,
-    mode: s.mode || 'row', line: s.line ?? -1, boxOriented: !!s.boxOriented,
+    boxOriented: !!s.boxOriented,
   });
   state.curShot = state.shots.some((x) => x.id === s.curShot) ? s.curShot : state.shots[0]?.id ?? null;
   if ((s.version || 1) >= 2) {
@@ -132,7 +136,7 @@ function invalidate(what) {
     filled: ['scored'],
   }[what] || ['ref', 'builtRect', 'filled', 'segs', 'pieces', 'scored'];
   for (const d of deps) {
-    if (d === 'filled') { state.filled = null; delete cache.filledAuto; state.line = -1; }
+    if (d === 'filled') { state.filled = null; delete cache.filledAuto; }
     else delete cache[d];
   }
   refreshStepBadges();
@@ -173,6 +177,7 @@ function ensureBuiltRect() {
     const seg = segmentPieces(state.img.built, 1, surf, cellW * cellH * 1.1);
     b.assembled = { mask: assembledMask(seg, H, Math.sqrt(cellW * cellH)), w: seg.w, h: seg.h };
     b.seg = { labels: seg.labels, mask: seg.mask, looseIds: seg.looseIds, w: seg.w, h: seg.h };
+    b.lab = seg.lab; // the built photo in Lab: colours of the assembled neighbours (see edges.js)
     b.foreground = { mask: seg.mask, w: seg.w, h: seg.h };
     // a border side assembled from corner to corner is complete (judged on everything that isn't cloth: loose
     // pieces piled against the frame can make parts of it look loose); its traced outer edge then shapes the grid
@@ -183,6 +188,7 @@ function ensureBuiltRect() {
   b.canvas = b.traced ? warpGrid(state.img.built, b.map, cols, rows, ref.w, ref.h) : warpQuad(state.img.built, state.quad.built, ref.w, ref.h);
   const lab = toLab(getImageData(b.canvas));
   b.centre = shiftedGridDescriptors(lab, ref.w, ref.h, cols, rows, DETECT_INNER);
+  b.descs = gridDescriptors(lab, ref.w, ref.h, cols, rows);
   cache.builtRect = b;
   return b;
 }
@@ -398,24 +404,14 @@ async function ensureScored() {
   const empty = emptyCells();
   await progress(`Comparing ${pieces.length} pieces with ${empty.length} empty cells…`);
   const b = ensureBuiltRect();
-  const needs = cellRequirements(empty, state.cols, state.rows, state.filled, cache.filledAuto, b.holeMask || b.assembled, b.map);
-  cache.scored = scoreAll(pieces, ref.descs, empty, needs);
+  const hm = b.holeMask || b.assembled;
+  const needs = cellRequirements(empty, state.cols, state.rows, state.filled, cache.filledAuto, hm && { ...hm, lab: b.lab }, b.map);
+  // compare pieces with the box picture as it looks photographed on the table (learned from the assembled cells)
+  const assembledCells = [];
+  for (let i = 0; i < cache.filledAuto.length; i++) if (cache.filledAuto[i]) assembledCells.push(i);
+  const cal = photoCalibration(ref.descs, b.descs, assembledCells);
+  cache.scored = scoreAll(pieces, cal ? ref.descs.map(cal) : ref.descs, empty, needs);
   return cache.scored;
-}
-
-function lineCells(mode, line) {
-  const { cols, rows } = state;
-  const f = state.filled;
-  const out = [];
-  if (mode === 'row') for (let c = 0; c < cols; c++) { const i = line * cols + c; if (!f[i]) out.push(i); }
-  else for (let r = 0; r < rows; r++) { const i = r * cols + line; if (!f[i]) out.push(i); }
-  return out;
-}
-const lineCount = () => (state.mode === 'row' ? state.rows : state.cols);
-
-function firstOpenLine() {
-  for (let l = 0; l < lineCount(); l++) if (lineCells(state.mode, l).length) return l;
-  return 0;
 }
 
 // ---------------------------------------------------------------- editors
@@ -612,59 +608,67 @@ async function showPieces() {
 }
 
 // ---------------------------------------------------------------- step 4: solve
-let lastMatches = [];
+// Piece by piece: every loose piece in the photos is matched to its best empty cell at once (globally, so no two
+// pieces claim the same cell). Only the pieces the app is confident about are shown unless "Show guesses too" is
+// ticked, most confident first, a few at a time so the arrows stay readable.
+const PAGE = 10;
+let lastMatches = [], solvePage = 0;
 async function showSolve() {
   await busy('Matching pieces…', async () => {
     ensureFilled();
     const pieces = await ensurePieces();
     if (!pieces.length) throw new Error('No pieces detected');
     await ensureScored();
-    if (state.line < 0 || state.line >= lineCount()) state.line = firstOpenLine();
     drawSolve();
   });
 }
 
+/** Best spot for every loose piece not marked as placed yet, most confident first. */
+function pieceSpots() {
+  if (!cache.spots || cache.spotsFor !== cache.scored) {
+    cache.spots = solveAll(cache.scored, cache.pieces, placedPieceIdx()).sort((a, b) => b.confidence - a.confidence);
+    cache.spotsFor = cache.scored;
+  }
+  return cache.spots;
+}
+
 function drawSolve() {
-  const pieces = cache.pieces, scored = cache.scored, ref = cache.ref;
-  const cells = lineCells(state.mode, state.line);
-  const name = state.mode === 'row' ? 'Row' : 'Column';
-  $('#line-label').textContent = `${name} ${state.line + 1}`;
-  $('#mode-row').classList.toggle('active', state.mode === 'row');
-  $('#mode-col').classList.toggle('active', state.mode === 'col');
-  const placed = placedPieceIdx();
-  const matches = cells.length ? solveLine(scored, pieces, cells, placed, state.cols) : [];
+  const pieces = cache.pieces, ref = cache.ref;
+  const guesses = $('#solve-guesses').checked;
+  const spots = pieceSpots();
+  const sure = spots.filter((m) => !isLow(m));
+  const list = guesses ? spots : sure;
+  const pages = Math.max(1, Math.ceil(list.length / PAGE));
+  solvePage = Math.min(Math.max(0, solvePage), pages - 1);
+  const matches = list.slice(solvePage * PAGE, (solvePage + 1) * PAGE);
   lastMatches = matches;
+  $('#page-label').textContent = list.length
+    ? `Pieces ${solvePage * PAGE + 1}–${solvePage * PAGE + matches.length} of ${list.length}` : 'No pieces';
+  $('#page-prev').disabled = solvePage === 0;
+  $('#page-next').disabled = solvePage >= pages - 1;
+  $('#btn-placed').disabled = !matches.length;
   const shots = shotsMap();
   renderSolution($('#solve-canvas'), {
     built: state.img.built, builtQuad: state.quad.built, gridToPx: ensureBuiltRect().map, cols: state.cols, rows: state.rows,
-    shots, matches, lineCells: cells,
+    shots, matches, lineCells: matches.map((m) => m.cell),
   });
-  const avail = pieces.length - placed.size;
+  const avail = pieces.length - placedPieceIdx().size;
   const allDone = state.filled.every((v) => v);
   $('#solve-info').textContent = allDone ? 'Every cell is filled. The puzzle is complete! 🎉'
-    : avail <= 0 ? 'All loose pieces in the photos are placed. Add a photo of the remaining pieces (step 3).'
-    : !cells.length ? `${name} ${state.line + 1} is complete. Use ▶ to go to the next unfinished line.`
-    : `${cells.length} empty cell(s) in this ${name.toLowerCase()}, ${avail} loose piece(s). ` +
-      `The arrow on each piece points to its top edge. Dashed arrows are uncertain guesses.`;
-  const list = $('#match-list');
-  list.innerHTML = '';
-  matches.forEach((m, i) => list.append(matchCard(m, i, shots, ref.canvas, state.cols, state.rows)));
-  saveState();
+    : avail <= 0 ? 'All loose pieces in the photos are placed. Add a photo of more pieces (step 3).'
+    : `The app is confident about ${sure.length} of your ${avail} loose piece(s)` +
+      (guesses ? `; the other ${spots.length - sure.length} are guesses (dashed arrows).`
+        : sure.length ? '. The others are left out; tick "Show guesses too" to see them.'
+        : '. Tick "Show guesses too" to see its best guesses, or add a closer photo of the pieces.') +
+      (matches.length ? ' The arrow on each piece points to its top edge.' : '');
+  const el = $('#match-list');
+  el.innerHTML = '';
+  matches.forEach((m, i) => el.append(matchCard(m, solvePage * PAGE + i, shots, ref.canvas, state.cols, state.rows)));
 }
 
-$('#mode-row').addEventListener('click', () => { state.mode = 'row'; state.line = firstOpenLine(); if (cache.scored) drawSolve(); });
-$('#mode-col').addEventListener('click', () => { state.mode = 'col'; state.line = firstOpenLine(); if (cache.scored) drawSolve(); });
-/** The next line in direction dir (+1 / -1) that still has empty cells (or simply the next one if none has). */
-function stepLine(dir) {
-  const n = lineCount();
-  for (let k = 1; k <= n; k++) {
-    const l = (state.line + dir * k + n * k) % n;
-    if (lineCells(state.mode, l).length) return l;
-  }
-  return (state.line + dir + n) % n;
-}
-$('#line-prev').addEventListener('click', () => { state.line = stepLine(-1); if (cache.scored) drawSolve(); });
-$('#line-next').addEventListener('click', () => { state.line = stepLine(1); if (cache.scored) drawSolve(); });
+$('#solve-guesses').addEventListener('change', () => { solvePage = 0; if (cache.scored) drawSolve(); });
+$('#page-prev').addEventListener('click', () => { solvePage--; if (cache.scored) drawSolve(); });
+$('#page-next').addEventListener('click', () => { solvePage++; if (cache.scored) drawSolve(); });
 $('#btn-placed').addEventListener('click', async () => {
   if (!lastMatches.length) return;
   for (const m of lastMatches) {
@@ -675,7 +679,6 @@ $('#btn-placed').addEventListener('click', async () => {
   saveState();
   toast(`Marked ${lastMatches.length} piece(s) as placed`);
   delete cache.scored;
-  if (!lineCells(state.mode, state.line).length) state.line = firstOpenLine();
   await showSolve();
 });
 
@@ -691,7 +694,7 @@ async function showPreview() {
     const scored = await ensureScored();
     await progress('Placing all pieces…');
     const placed = placedPieces();
-    const all = solveAll(scored, pieces, new Set(placed.map((x) => x.piece.idx)));
+    const all = pieceSpots(); // the same spots the Solve step shows
     // pieces already put down via "I placed these" are drawn in their cells too (the built photo predates them)
     const done = placed.filter((x) => x.pt.cell != null && x.pt.cell < state.cols * state.rows)
       .map((x) => ({ cell: x.pt.cell, piece: x.piece, angle: x.pt.angle ?? x.piece.angle, confidence: 1, placed: true }));
@@ -701,28 +704,40 @@ async function showPreview() {
     const total = state.cols * state.rows;
     const filledNow = state.filled.reduce((a, b) => a + b, 0);
     const gaps = empty - all.length;
-    $('#preview-info').textContent =
-      `${all.length} of ${empty} empty cells get a piece (${sure} confident, ${all.length - sure} guesses). ` +
-      (gaps > 0 ? `${gaps} cell(s) have no piece in the photos yet. ` : 'Every gap is covered. ') +
-      `The puzzle would be ${Math.round(((filledNow + all.length) / total) * 100)}% complete.`;
+    previewCounts = { all: all.length, sure, empty, gaps, filledNow, total };
+    updatePreviewInfo();
     drawPreview();
     previewEl.hidden = false;
     document.body.style.overflow = 'hidden';
   });
 }
+let previewCounts = null;
+/** Only confident placements are drawn unless "Show guesses too" is ticked; then guesses get an orange outline. */
+function updatePreviewInfo() {
+  const { all, sure, empty, gaps, filledNow, total } = previewCounts;
+  const guesses = $('#preview-mark').checked;
+  const shown = guesses ? all : sure;
+  $('#preview-info').textContent =
+    `${sure} of ${empty} empty cells have a piece the app is confident about` +
+    (all > sure ? `, ${all - sure} more ${guesses ? 'are guesses (orange)' : 'only have a guess (hidden)'}. ` : '. ') +
+    (gaps > 0 ? `${gaps} cell(s) have no piece in the photos yet. ` : '') +
+    `Shown: ${Math.round(((filledNow + shown) / total) * 100)}% complete.`;
+}
 function drawPreview() {
   if (!lastPreview) return;
+  const guesses = $('#preview-mark').checked;
   renderPreview($('#preview-canvas'), {
     builtRect: cache.builtRect.canvas, refRect: cache.ref.canvas, shots: shotsMap(),
-    cols: state.cols, rows: state.rows, filled: state.filled, placements: lastPreview,
-    markUncertain: $('#preview-mark').checked,
+    cols: state.cols, rows: state.rows, filled: state.filled,
+    placements: guesses ? lastPreview : lastPreview.filter((m) => m.placed || !isLow(m)),
+    markUncertain: guesses,
   });
 }
 function closePreview() { previewEl.hidden = true; document.body.style.overflow = ''; }
 document.querySelectorAll('.btn-preview').forEach((b) => b.addEventListener('click', showPreview));
 $('#preview-close').addEventListener('click', closePreview);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !previewEl.hidden) closePreview(); });
-$('#preview-mark').addEventListener('change', drawPreview);
+$('#preview-mark').addEventListener('change', () => { updatePreviewInfo(); drawPreview(); });
 $('#preview-save').addEventListener('click', () => $('#preview-canvas').toBlob((b) => window.open(URL.createObjectURL(b), '_blank')));
 
 $('#btn-zoom-toggle').addEventListener('click', () => {
@@ -756,7 +771,8 @@ function goto(step) {
   document.querySelectorAll('#steps button').forEach((b) => b.classList.toggle('active', b.dataset.step === step));
   refreshStepBadges();
   window.scrollTo({ top: 0 });
-  renderStep(step);
+  // wait until the saved photos are restored (a tap during startup would otherwise see half the state)
+  booted.then(() => { if (currentStep === step) renderStep(step); });
 }
 document.querySelectorAll('#steps button').forEach((b) => b.addEventListener('click', () => goto(b.dataset.step)));
 document.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => goto(b.dataset.goto)));
@@ -772,7 +788,7 @@ $('#btn-demo').addEventListener('click', () => busy('Generating demo puzzle…',
   state.quad = { box: d.boxQuad, built: d.builtQuad };
   state.boxOriented = true;
   state.cols = d.cols; state.rows = d.rows; state.count = d.count;
-  state.filled = null; state.overrides = {}; state.placedPts = []; state.line = -1; state.mode = 'row'; state.sens = 1;
+  state.filled = null; state.overrides = {}; state.placedPts = []; state.sens = 1;
   cache = {};
   syncGridInputs();
   for (const k of ['box', 'built']) await saveOriginal(k, await store.canvasToBlob(state.img[k], 'image/png'));
@@ -788,11 +804,13 @@ $('#btn-reset').addEventListener('click', async () => {
 });
 
 // ---------------------------------------------------------------- boot
-const booted = (async () => {
+(async () => {
   try { await restore(); } catch (e) { console.warn('restore failed', e); }
   syncGridInputs();
+  markBooted();
   goto('box');
 })();
+window.__appStarted = true; // every handler is in place (index.html shows startup errors until then)
 
 // expose for debugging
 window.__pr = { state, cache: () => cache };

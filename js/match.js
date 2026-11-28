@@ -1,6 +1,7 @@
 // Appearance descriptors and matching of pieces to puzzle cells.
 import { sample3, otsu, median } from './imageutil.js';
 import { invertH } from './geometry.js';
+import { pieceEdges, neighbourEdge, edgeDist, edgeStats, calibEdge } from './edges.js';
 import { PROFILE_T, PROFILE_D, coverToEdge, straighten, classify, profileDist } from './outline.js';
 
 export const N = 8;          // descriptor grid is N x N
@@ -57,6 +58,73 @@ export function gridDescriptors(lab, w, h, cols, rows, inner = INNER) {
   const out = [];
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out.push(cellDescriptor(lab, w, h, c * cw, r * ch, cw, ch, inner));
   return out;
+}
+
+/** Solve a small dense linear system A x = b (Gaussian elimination); returns x or null if singular. */
+function solveLinear(A, b) {
+  const n = b.length, M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-9) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
+}
+
+/**
+ * How the box picture looks once printed on pieces and photographed on the table: an affine colour map (3x3 + offset
+ * in Lab) fitted on the cells that are already assembled in the built photo, where both the box picture and the
+ * photographed pieces are known. The box print, its gloss and the room light differ a lot (dark navy water on the
+ * box can be pale blue-grey on the table), which a simple mean/spread match can't capture. Cells that disagree badly
+ * (a covered part of the box, a cell the grid misses) are dropped and the fit repeated.
+ * Returns a function mapping a box descriptor to a photo-like one, or null when there are too few cells.
+ */
+export function photoCalibration(refDescs, builtDescs, cells) {
+  if (cells.length < 20) return null;
+  let use = cells.slice(), M = null;
+  for (let it = 0; it < 3; it++) {
+    const AtA = Array.from({ length: 4 }, () => new Float64Array(4)), Atb = [0, 1, 2].map(() => new Float64Array(4));
+    for (const i of use) {
+      const r = refDescs[i], b = builtDescs[i];
+      for (let k = 0; k < r.length; k += 3) {
+        const x = [r[k], r[k + 1], r[k + 2], 1];
+        for (let u = 0; u < 4; u++) {
+          for (let v = 0; v < 4; v++) AtA[u][v] += x[u] * x[v];
+          for (let ch = 0; ch < 3; ch++) Atb[ch][u] += x[u] * b[k + ch];
+        }
+      }
+    }
+    const rows = [0, 1, 2].map((ch) => solveLinear(AtA.map((r) => Array.from(r)), Array.from(Atb[ch])));
+    if (rows.some((r) => !r)) return null;
+    M = rows;
+    // drop the cells the map fits worst (top 20%) and refit
+    const err = use.map((i) => {
+      const r = refDescs[i], b = builtDescs[i];
+      let e = 0;
+      for (let k = 0; k < r.length; k += 3) for (let ch = 0; ch < 3; ch++) {
+        const m = M[ch], v = m[0] * r[k] + m[1] * r[k + 1] + m[2] * r[k + 2] + m[3];
+        e += Math.abs(v - b[k + ch]);
+      }
+      return e;
+    });
+    const lim = err.slice().sort((x, y) => x - y)[Math.floor(err.length * 0.8)];
+    use = use.filter((_, j) => err[j] <= lim);
+    if (use.length < 20) break;
+  }
+  return (d) => {
+    const o = new Float32Array(d.length);
+    for (let k = 0; k < d.length; k += 3) for (let ch = 0; ch < 3; ch++) {
+      const m = M[ch];
+      o[k + ch] = m[0] * d[k] + m[1] * d[k + 1] + m[2] * d[k + 2] + m[3];
+    }
+    return o;
+  };
 }
 
 /**
@@ -211,7 +279,8 @@ function holeProfile(assembled, toPx, c, r, t) {
  *  - 'F' on the puzzle's edge (flat side), 'N' (not flat) for an interior side next to a cell that is still empty
  *    or was filled after the photo;
  *  - next to a piece assembled in the photo: 'B' / 'T' (blank / tab) or null if unclear, and the outline of the
- *    hole that neighbour leaves in `.prof[t]` (straightened profile, see outline.js).
+ *    hole that neighbour leaves in `.prof[t]` (straightened profile, see outline.js), and the colours just inside
+ *    that neighbour's edge in `.edge[t]` (see edges.js; needs assembled.lab, the built photo in Lab).
  * assembled: the built photo's assembled-puzzle mask (or null); photoFilled: cells filled in the photo itself;
  * toPx(gx, gy) -> [x, y]: where grid points are in the built photo (see gridmap.js).
  */
@@ -220,16 +289,17 @@ export function cellRequirements(emptyCells, cols, rows, filled, photoFilled, as
   for (const cell of emptyCells) {
     const c = cell % cols, r = (cell / cols) | 0;
     const nb = [r > 0 ? cell - cols : -1, c < cols - 1 ? cell + 1 : -1, r < rows - 1 ? cell + cols : -1, c > 0 ? cell - 1 : -1];
-    const prof = [null, null, null, null];
+    const prof = [null, null, null, null], edge = [null, null, null, null];
     const need = nb.map((n, t) => {
       if (n < 0) return 'F';
       if (!filled[n]) return 'N';
       if (!assembled || !photoFilled || !photoFilled[n]) return 'N'; // placed later: shape unknown
       prof[t] = holeProfile(assembled, toPx, c, r, t);
+      if (assembled.lab) edge[t] = neighbourEdge(assembled.lab, assembled.mask, assembled.w, assembled.h, toPx, c, r, t);
       const k = classify(prof[t]);
       return k === 'F' ? 'N' : k; // a neighbour inside the puzzle never leaves a straight edge
     });
-    need.prof = prof;
+    need.prof = prof; need.edge = edge;
     out.set(cell, need);
   }
   return out;
@@ -343,6 +413,7 @@ export function describePieces(seg) {
   const { lab, labels, w, h, pieces } = seg;
   for (const p of pieces) {
     p.descs = SAMPLE_ANGLES.map((a) => pieceDescriptor(lab, labels, w, h, p, p.angle + a));
+    p.edges = pieceEdges(lab, labels, w, h, p);
   }
   seg.lab = null; // not needed any more; can be ~50 MB per photo
 }
@@ -368,7 +439,10 @@ function sideMismatch(have, need) {
   return have === need ? 0 : 1;
 }
 
-export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outlineWeight = OUTLINE_WEIGHT) {
+/** Score per unit of colour mismatch (Lab) with the strip inside an assembled neighbour's edge (see edges.js). */
+export const EDGE_WEIGHT = 0.25;
+
+export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outlineWeight = OUTLINE_WEIGHT, edgeWeight = EDGE_WEIGHT) {
   // cellNeeds (optional): Map cell -> [top, right, bottom, left] side requirements (see sideMismatch)
   // calibrate the pieces' colours against the region that is still empty: those are the same picture parts.
   // Done per photo, since each photo has its own lighting and white balance.
@@ -386,6 +460,7 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outline
   }
   const P = pieces.length, C = emptyCells.length;
   const score = new Float32Array(P * C), rot = new Uint8Array(P * C), score4 = new Float32Array(P * C * 4);
+  const edgeCost = neighbourColourCosts(pieces, emptyCells, cellNeeds, byShot, edgeWeight);
   pieces.forEach((p, pi) => {
     const cal = cals.get(p.shot ?? 0);
     const cd = p.descs.map((x) => applyCalib(x.d, cal));
@@ -405,6 +480,8 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outline
             for (let t = 0; t < 4; t++) if (need.prof[t]) v += outlineCost(p.profiles[(t + k) % 4], need.prof[t], outlineWeight);
           }
         }
+        const ec = edgeCost.get(ci);
+        if (ec) for (const [t, costs] of ec) v += costs[pi * 4 + ((t + k) % 4)];
         score4[(pi * C + ci) * 4 + k] = v;
         if (v < best) { best = v; bk = k; }
       }
@@ -412,6 +489,42 @@ export function scoreAll(pieces, refDescs, emptyCells, cellNeeds = null, outline
     }
   });
   return { score, score4, rot, cells: emptyCells, outlineWeight };
+}
+
+/**
+ * Colour continuity with assembled neighbours: for each empty cell side next to a piece assembled in the built photo,
+ * the cost of each piece side sitting there (Map cellIndex -> [[t, Float32Array(P * 4)]]). The pieces photos are
+ * calibrated to the built photo first (same table, but not the same exposure). Costs are centred on the median over
+ * all pieces, so cells with known neighbours are not more or less attractive as such.
+ */
+function neighbourColourCosts(pieces, emptyCells, cellNeeds, byShot, weight) {
+  const out = new Map();
+  if (!cellNeeds || !weight) return out;
+  const holes = [];
+  for (const need of cellNeeds.values()) if (need.edge) for (const e of need.edge) if (e) holes.push(e);
+  if (!holes.length) return out;
+  const hStats = edgeStats(holes);
+  const cal = new Map();
+  for (const [k, list] of byShot) cal.set(k, makeCalib(edgeStats(list.flatMap((p) => p.edges || [])), hStats, 0.7));
+  const edges = pieces.map((p) => p.edges && p.edges.map((e) => calibEdge(e, cal.get(p.shot ?? 0))));
+  const P = pieces.length;
+  emptyCells.forEach((cell, ci) => {
+    const need = cellNeeds.get(cell);
+    if (!need || !need.edge) return;
+    const list = [];
+    need.edge.forEach((hole, t) => {
+      if (!hole) return;
+      const d = new Float32Array(P * 4).fill(NaN);
+      for (let pi = 0; pi < P; pi++) if (edges[pi]) for (let s = 0; s < 4; s++) d[pi * 4 + s] = edgeDist(edges[pi][s], hole);
+      const fin = Array.from(d).filter(Number.isFinite);
+      if (fin.length < 4) return;
+      const med = median(fin), cap = med * 2.5;
+      for (let i = 0; i < d.length; i++) d[i] = Number.isFinite(d[i]) ? weight * (Math.min(cap, d[i]) - med) : 0;
+      list.push([t, d]);
+    });
+    if (list.length) out.set(ci, list);
+  });
+  return out;
 }
 
 /** Outline cost of fitting a piece side (straightened profile) into a hole outline. */

@@ -1,19 +1,73 @@
 // Image loading and pixel helpers.
 
-/** Load a File/Blob into a canvas, downscaled so the longest side <= maxDim. */
+/**
+ * Load a File/Blob into a canvas, downscaled so the longest side <= maxDim.
+ * Phone photos are large (12-200 MP): decoding them at full size can run a phone out of memory, so the browser is
+ * asked to decode straight to the reduced size where it can (createImageBitmap with a resize). The plain <img> path
+ * is the fallback. Photos the browser can't read at all (HEIC on most browsers) get an explanation.
+ */
 export async function loadImage(blob, maxDim = 1600) {
-  const url = URL.createObjectURL(blob);
-  try {
-    const img = await new Promise((resolve, reject) => {
-      const im = new Image();
-      im.onload = () => resolve(im);
-      im.onerror = () => reject(new Error('Could not read image'));
-      im.src = url;
-    });
-    return imageToCanvas(img, maxDim);
-  } finally {
-    URL.revokeObjectURL(url);
+  let src = null;
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const opt = { resizeQuality: 'high', imageOrientation: 'from-image' };
+      const size = await jpegSize(blob);
+      if (size && Math.max(size.w, size.h) <= maxDim) src = await createImageBitmap(blob, opt); // small already
+      else {
+        src = await createImageBitmap(blob, { ...opt, resizeWidth: maxDim });
+        if (src.height > maxDim) { src.close(); src = await createImageBitmap(blob, { ...opt, resizeHeight: maxDim }); }
+      }
+    } catch (e) {
+      src = null;
+    }
   }
+  if (!src) {
+    const url = URL.createObjectURL(blob);
+    try {
+      src = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error('unreadable'));
+        im.src = url;
+      });
+    } catch (e) {
+      throw new Error(await unreadableReason(blob));
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+  const c = imageToCanvas(src, maxDim); // also scales down if the browser ignored the resize options
+  if (src.close) src.close();
+  return c;
+}
+
+/** Pixel size of a JPEG from its header (the SOF marker), without decoding it; null if not found. */
+async function jpegSize(blob) {
+  const b = new Uint8Array(await blob.slice(0, 512 * 1024).arrayBuffer());
+  if (b[0] !== 0xff || b[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xff) { i++; continue; }
+    const m = b[i + 1], len = (b[i + 2] << 8) | b[i + 3];
+    if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+      return { h: (b[i + 5] << 8) | b[i + 6], w: (b[i + 7] << 8) | b[i + 8] };
+    }
+    i += 2 + len;
+  }
+  return null;
+}
+
+/** Why a photo can't be read, in words a user can act on. */
+async function unreadableReason(blob) {
+  const head = new Uint8Array(await blob.slice(0, 32).arrayBuffer());
+  const brand = String.fromCharCode(...head.slice(4, 12));
+  const heic = /heic|heif/i.test(blob.type || '') || /^ftyp(heic|heix|hevc|hevx|mif1|msf1)/.test(brand);
+  if (heic) {
+    return 'This photo is in HEIC format, which this browser can\'t read. Take it with "📷 Take photo" instead, ' +
+      'or set the camera to save photos as JPEG ("Most compatible" on iPhone, turn off "HEIF" on Android).';
+  }
+  return `Could not read this photo${blob.type ? ` (${blob.type})` : ''}. Try taking it with "📷 Take photo", ` +
+    'or save it as a JPEG first.';
 }
 
 export function imageToCanvas(img, maxDim) {

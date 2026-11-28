@@ -6,9 +6,9 @@ A phone-friendly web app that helps you finish a real jigsaw puzzle. You take th
 2. **Built**: what you have already assembled.
 3. **Pieces**: the loose pieces spread out on a plain, even background.
 
-The app then works **one line at a time** (row or column). It highlights the loose pieces that belong in the
-next line and draws arrows to where they go in your puzzle. Each piece also gets a small arrow that shows which
-way is *up*, so you know how to turn it.
+The app then shows **where the loose pieces you photographed go**. It only shows the pieces it is confident
+about, most confident first, and draws arrows from each piece to its spot in your puzzle. Each piece also gets a
+small arrow that shows which way is *up*, so you know how to turn it.
 
 Everything runs in the browser on your phone. No photos are uploaded anywhere.
 
@@ -21,7 +21,7 @@ Open the site on your phone (see *Hosting* below) and go through the four tabs:
 | **1 · Box** | Take or pick a photo of the box picture and drag the 4 corners onto the picture's corners. A sideways or upside-down photo is fine: the app turns it to match your puzzle (or use **↻ Rotate picture**). Enter the number of pieces. The app estimates columns × rows; correct them if needed by counting the pieces along one edge. |
 | **2 · Built** | Photograph the puzzle from straight above and drag the corners to where the corners of the *finished* puzzle will be. Check that the grid lines follow the seams between pieces. Cells covered by the assembled puzzle are marked in green; loose pieces lying on the cloth are not counted. Tap a cell to fix a mistake. |
 | **3 · Pieces** | Spread pieces face up on a plain cloth or board and photograph them from above. Add as many photos as you need, each of a different part of the cloth. Floor, chairs or the box at the edges are ignored. Detected pieces are outlined; red marks groups of touching pieces, which are skipped. Use the sensitivity slider if the outlines are off. |
-| **4 · Solve** | Shows the next incomplete row. Coloured arrows go from each piece to its cell. Use ◀ ▶ to change line, or switch to columns. After placing the pieces, tap **✓ I placed these** to move on without retaking photos. |
+| **4 · Solve** | Shows where the loose pieces in your photos go, ten at a time, most confident first. Coloured arrows go from each piece to its cell; ◀ ▶ shows the next ten. Pieces the app isn't sure about are left out unless you tick **Show guesses too**. After placing the pieces, tap **✓ I placed these** to move on without retaking photos. |
 
 **👁 Preview** (on the Pieces and Solve steps) places *every* loose piece in the photo at once and shows what the
 puzzle would look like. Each piece is cut out of your photo, turned upright and drawn in its best cell, tabs
@@ -71,10 +71,13 @@ Photos stay on the device and browser where they were taken. **Reset** clears ev
   colours are first calibrated, per photo, against the still-empty part of the box picture. Piece shape adds a
   penalty when it contradicts a cell. Each side is classified as tab, blank or flat: border cells need flat
   sides and interior cells must not have them. Next to an assembled piece, the built photo shows whether its tab
-  pokes into the gap, so the new piece needs a blank there, or a tab otherwise. Pieces are assigned to the line's
-  cells greedily by a two-way softmax confidence. Low-confidence guesses are shown dashed.
-- **Preview**: all available pieces are assigned to all empty cells at once with the Hungarian algorithm (minimum
-  total appearance distance, one piece per cell), using the same confidence measure.
+  pokes into the gap, so the new piece needs a blank there, or a tab otherwise. Each side's outline is also
+  compared with the hole the assembled neighbours leave. Before comparing, the box picture is mapped to how it
+  looks photographed on the table, using the cells already assembled in the built photo.
+- **Placement**: all loose pieces are assigned to the empty cells at once with the Hungarian algorithm (minimum
+  total distance, one piece per cell). Each placement gets a two-way softmax confidence (how much better this cell
+  is than others for the piece, and this piece than others for the cell). Solve and Preview show only confident
+  placements unless guesses are asked for.
 
 The code is plain ES modules with no build step and no dependencies:
 
@@ -83,7 +86,7 @@ index.html, css/style.css
 js/app.js         UI flow, state, persistence
 js/geometry.js    homography + perspective warp
 js/segment.js     background model, piece mask, pose estimation
-js/match.js       descriptors, filled detection, scoring, line assignment
+js/match.js       descriptors, filled detection, scoring, assignment
 js/render.js      overlay with arrows, match cards
 js/quadeditor.js  draggable corner editor with magnifier
 js/demo.js        synthetic puzzle generator
@@ -104,6 +107,9 @@ It is a static site.
   `https://<user>.github.io/PuzzleResolver/` on your phone.
 - **Local network**: run `python -m http.server 8765` in this folder and open `http://<your-PC-IP>:8765` on
   your phone (same Wi-Fi). The camera works through the file picker, so HTTPS is not required.
+
+After changing any file in `js/` or `css/`, run `python tools/stamp.py` before committing. It writes each file's
+content fingerprint into `index.html`, so a phone that cached an older version never mixes old and new files.
 
 ## Limitations
 

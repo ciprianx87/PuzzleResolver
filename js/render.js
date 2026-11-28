@@ -39,7 +39,7 @@ function arrowHead(ctx, tip, from, size) {
 }
 
 /**
- * Composite: built puzzle photo on top, below it the pieces photos that contain this line's pieces, and arrows
+ * Composite: built puzzle photo on top, below it the pieces photos that contain the shown pieces, and arrows
  * from each piece to its target cell.
  * shots: Map shotId -> { img, seg, label }; each match's piece carries its shot id.
  */
@@ -54,7 +54,7 @@ export function renderSolution(canvas, opt) {
   const sT = W / topBox.w;
   const topH = Math.round(topBox.h * sT);
 
-  // one band per pieces photo that has a match in this line (or the first photo if there is none)
+  // one band per pieces photo that has a shown piece (or the first photo if there is none)
   let ids = [...new Set(matches.map((m) => m.piece.shot))];
   if (!ids.length && shots.size) ids = [shots.keys().next().value];
   const bands = new Map();
@@ -119,7 +119,7 @@ export function renderSolution(canvas, opt) {
     cellPoly(lineCells[0] ?? 0)[1].y - cellPoly(lineCells[0] ?? 0)[0].y);
   const br = Math.max(9, Math.min(18, cellSizePx * 0.32));
 
-  // all target cells of the line: dashed outline
+  // all target cells: dashed outline
   const matchedCells = new Map(matches.map((m, i) => [m.cell, i]));
   for (const cell of lineCells) {
     const poly = cellPoly(cell);
@@ -291,9 +291,24 @@ function cutOut(piecesImg, seg, piece) {
   return { img: c, x0, y0 };
 }
 
-/** Draw a whole loose piece (tabs included), turned upright, with its core on a grid cell. */
-function drawPieceInCell(ctx, cut, piece, angle, x, y, cw, ch) {
+/** Average colour of a piece's core (as a CSS colour), from its cut-out. */
+function coreColour(cut, piece) {
+  const ctx = cut.img.getContext('2d', { willReadFrequently: true });
+  const r = Math.max(1, Math.round(piece.side * 0.3));
+  const x = Math.round(piece.cx - cut.x0 - r), y = Math.round(piece.cy - cut.y0 - r);
+  const d = ctx.getImageData(Math.max(0, x), Math.max(0, y), 2 * r, 2 * r).data;
+  let R = 0, G = 0, B = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 200) { R += d[i]; G += d[i + 1]; B += d[i + 2]; n++; }
+  return n ? `rgb(${Math.round(R / n)},${Math.round(G / n)},${Math.round(B / n)})` : '#888';
+}
+
+/**
+ * Draw a loose piece turned into its cell, with its core on the grid cell. clip: only the square core (tabs cut
+ * off), so cores tile into a tidy grid even where guessed neighbours' tabs and blanks don't interlock.
+ */
+function drawPieceInCell(ctx, cut, piece, angle, x, y, cw, ch, clip = false) {
   ctx.save();
+  if (clip) { ctx.beginPath(); ctx.rect(x - 0.5, y - 0.5, cw + 1, ch + 1); ctx.clip(); }
   ctx.translate(x + cw / 2, y + ch / 2);
   ctx.scale(cw / piece.side, ch / piece.side);
   ctx.rotate(-angle);
@@ -319,11 +334,7 @@ export function renderPreview(canvas, { builtRect, refRect, shots, cols, rows, f
   const byCell = new Map(placements.map((p) => [p.cell, p]));
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
     const i = r * cols + c, x = c * cw, y = r * ch;
-    if (byCell.has(i)) {
-      // under a piece: the box picture shows through its cut-outs (neighbours' tabs fill them in reality)
-      ctx.drawImage(refRect, c * rw, r * rh, rw, rh, x, y, cw, ch);
-      continue;
-    }
+    if (byCell.has(i)) continue; // drawn below
     if (filled[i]) continue;
     // gap: faded box picture + hatching
     ctx.fillStyle = '#1d2733';
@@ -339,12 +350,17 @@ export function renderPreview(canvas, { builtRect, refRect, shots, cols, rows, f
     ctx.stroke();
     ctx.restore();
   }
-  // pieces, tabs included, so they also cover the gaps their neighbours leave
-  for (const pl of placements) {
-    const c = pl.cell % cols, r = (pl.cell / cols) | 0;
+  // pieces, turned into their cells, in three layers: the piece's own colour fills the cell (so a blank that no
+  // neighbouring tab fills doesn't show a hole), then whole pieces with their tabs, then every piece's square core
+  // on top, so the grid stays tidy even where guessed neighbours' tabs and blanks don't interlock
+  const drawn = placements.map((pl) => {
     const shot = shots.get(pl.piece.shot);
-    drawPieceInCell(ctx, cutOut(shot.img, shot.seg, pl.piece), pl.piece, pl.angle, c * cw, r * ch, cw, ch);
-  }
+    const cut = cutOut(shot.img, shot.seg, pl.piece);
+    return { pl, cut, x: (pl.cell % cols) * cw, y: ((pl.cell / cols) | 0) * ch };
+  });
+  for (const { pl, cut, x, y } of drawn) { ctx.fillStyle = coreColour(cut, pl.piece); ctx.fillRect(x, y, cw, ch); }
+  for (const { pl, cut, x, y } of drawn) drawPieceInCell(ctx, cut, pl.piece, pl.angle, x, y, cw, ch);
+  for (const { pl, cut, x, y } of drawn) drawPieceInCell(ctx, cut, pl.piece, pl.angle, x, y, cw, ch, true);
   // faint grid
   ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 1;
   ctx.beginPath();

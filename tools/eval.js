@@ -4,12 +4,12 @@ import { generateDemo } from '../js/demo.js';
 import { toLab, getImageData } from '../js/imageutil.js';
 import { warpQuad, quadAspect, rectifiedSize } from '../js/geometry.js';
 import { segmentPieces } from '../js/segment.js';
-import { gridDescriptors, detectFilled, DETECT_INNER, describePieces, scoreAll, solveLine, cellRequirements } from '../js/match.js';
+import { gridDescriptors, detectFilled, DETECT_INNER, describePieces, scoreAll, solveLine, cellRequirements, photoCalibration } from '../js/match.js';
 import { homography, rectCorners } from '../js/geometry.js';
 import { homographyMap } from '../js/gridmap.js';
 import { segmentPieces as seg2 } from '../js/segment.js';
 
-export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, outlineWeight = undefined, chain = true, plain = false, noise = 0) {
+export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, outlineWeight = undefined, chain = true, plain = false, noise = 0, useCal = true, edgeWeight = undefined) {
   // noise: random colour shift per piece (Lab units), like uneven light on a real table
   // plain: a gradient sky instead of the colourful picture
   // colorKeep: 1 = real colours; less fades every piece and cell towards the same grey (0 = shape cues only),
@@ -20,7 +20,10 @@ export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, out
     const { w, h } = rectifiedSize(d.cols, d.rows, quadAspect(d.boxQuad));
     const ref = warpQuad(d.box, d.boxQuad, w, h), refLab = toLab(getImageData(ref));
     const built = warpQuad(d.built, d.builtQuad, w, h), bLab = toLab(getImageData(built));
-    const refD = gridDescriptors(refLab, w, h, d.cols, d.rows);
+    let refD = gridDescriptors(refLab, w, h, d.cols, d.rows);
+    // as in the app: the box picture as it looks photographed, learned from the assembled cells
+    const cal = photoCalibration(refD, gridDescriptors(bLab, w, h, d.cols, d.rows), [...d.filled]);
+    if (cal && useCal) refD = refD.map(cal);
     const { filled } = detectFilled(gridDescriptors(bLab, w, h, d.cols, d.rows, DETECT_INNER), gridDescriptors(refLab, w, h, d.cols, d.rows, DETECT_INNER));
     for (let i = 0; i < filled.length; i++) if (!!filled[i] !== d.filled.has(i)) tot.filledErr++;
     tot.cells += filled.length;
@@ -39,7 +42,7 @@ export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, out
       const mask = new Uint8Array(bs.w * bs.h);
       for (let p = 0; p < mask.length; p++) mask[p] = bs.mask[p] && !bs.looseIds.has(bs.labels[p]) ? 1 : 0;
       const filledArr = new Uint8Array(d.cols * d.rows); for (const i of d.filled) filledArr[i] = 1;
-      needs = cellRequirements(empty, d.cols, d.rows, filledArr, filledArr, { mask, w: bs.w, h: bs.h }, homographyMap(homography(rectCorners(d.cols, d.rows), d.builtQuad)));
+      needs = cellRequirements(empty, d.cols, d.rows, filledArr, filledArr, { mask, w: bs.w, h: bs.h, lab: bs.lab }, homographyMap(homography(rectCorners(d.cols, d.rows), d.builtQuad)));
     }
     if (noise) {
       let st = seed0 * 7919 + k;
@@ -47,6 +50,7 @@ export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, out
       for (const p of seg.pieces) {
         const off = [rnd() * 2 * noise, rnd() * noise, rnd() * noise];
         p.descs = p.descs.map((x) => ({ d: x.d.map((v, i) => v + off[i % 3] + rnd() * noise * 0.5), wt: x.wt }));
+        if (p.edges) p.edges = p.edges.map((e) => ({ c: e.c.map((v, i) => v + off[i % 3] + rnd() * noise * 0.5), wt: e.wt }));
       }
     }
     if (colorKeep < 1) {
@@ -54,7 +58,7 @@ export async function run(n = 10, seed0 = 1, useShape = true, colorKeep = 1, out
       for (let i = 0; i < refD.length; i++) refD[i] = fade(refD[i]);
       for (const p of seg.pieces) p.descs = p.descs.map((x) => ({ d: fade(x.d), wt: x.wt }));
     }
-    const scored = scoreAll(seg.pieces, refD, empty, needs, outlineWeight);
+    const scored = scoreAll(seg.pieces, refD, empty, needs, outlineWeight, edgeWeight);
     for (let line = 0; line < d.rows; line++) {
       const cells = empty.filter((c) => ((c / d.cols) | 0) === line);
       if (!cells.length) continue;

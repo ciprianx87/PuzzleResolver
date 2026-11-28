@@ -7,7 +7,48 @@
   <title>Puzzle Resolver</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/style.css?v=308ca5f01b">
+  <script>
+    // If the app fails while starting (an old cached file, an unsupported browser), say so instead of leaving
+    // buttons that half work. Errors after a successful start are shown by the app itself.
+    (function () {
+      function show(msg) {
+        if (window.__appStarted || document.getElementById('start-error')) return;
+        var d = document.createElement('div');
+        d.id = 'start-error';
+        d.setAttribute('role', 'alert');
+        d.style.cssText = 'position:fixed;inset:auto 12px 12px 12px;z-index:1000;padding:14px 16px;border-radius:12px;' +
+          'background:#7a1f1f;color:#fff;font:15px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35)';
+        d.textContent = 'The app did not start properly: ' + msg + ' ';
+        var b = document.createElement('button');
+        b.textContent = 'Reload';
+        b.style.cssText = 'margin-left:6px;padding:6px 12px;border-radius:8px;border:0;font:inherit;cursor:pointer';
+        b.onclick = function () { location.reload(); };
+        d.appendChild(b);
+        (document.body || document.documentElement).appendChild(d);
+      }
+      window.addEventListener('error', function (e) { show(e.message || 'unknown error'); });
+      window.addEventListener('unhandledrejection', function (e) { show((e.reason && e.reason.message) || String(e.reason)); });
+    })();
+  </script>
+  <script type="importmap">
+  {
+    "imports": {
+      "./js/app.js": "./js/app.js?v=8afa003f67",
+      "./js/demo.js": "./js/demo.js?v=ec1031d1f6",
+      "./js/edges.js": "./js/edges.js?v=6c8a25e741",
+      "./js/geometry.js": "./js/geometry.js?v=da8e4e7111",
+      "./js/gridmap.js": "./js/gridmap.js?v=416ca0cd24",
+      "./js/imageutil.js": "./js/imageutil.js?v=6311675266",
+      "./js/match.js": "./js/match.js?v=cefc3f9a4b",
+      "./js/outline.js": "./js/outline.js?v=b0e4727dde",
+      "./js/quadeditor.js": "./js/quadeditor.js?v=0f32f751db",
+      "./js/render.js": "./js/render.js?v=593e6cc097",
+      "./js/segment.js": "./js/segment.js?v=15cc4ec858",
+      "./js/store.js": "./js/store.js?v=b17b2ca5ff"
+    }
+  }
+  </script>
 </head>
 <body>
   <header class="topbar">
@@ -95,16 +136,13 @@
 
     <!-- STEP 4: SOLVE -->
     <section class="step" id="step-solve" hidden>
-      <h2>Next line</h2>
+      <h2>Where your loose pieces go</h2>
       <div class="solve-controls">
-        <div class="seg-toggle">
-          <button id="mode-row" class="active">Rows</button>
-          <button id="mode-col">Columns</button>
-        </div>
+        <label class="check"><input type="checkbox" id="solve-guesses"> Show guesses too</label>
         <div class="line-picker">
-          <button id="line-prev" class="small">◀</button>
-          <span id="line-label">Row 1</span>
-          <button id="line-next" class="small">▶</button>
+          <button id="page-prev" class="small" aria-label="Previous pieces">◀</button>
+          <span id="page-label">Pieces 1–10</span>
+          <button id="page-next" class="small" aria-label="Next pieces">▶</button>
         </div>
       </div>
       <p class="hint small" id="solve-info"></p>
@@ -129,17 +167,18 @@
       <p class="hint small" id="preview-info"></p>
       <canvas id="preview-canvas" class="editor"></canvas>
       <div class="row">
-        <label class="check"><input type="checkbox" id="preview-mark" checked> Mark uncertain pieces</label>
+        <label class="check"><input type="checkbox" id="preview-mark"> Show guesses too</label>
         <button id="preview-save" class="small">Open full image</button>
       </div>
-      <p class="hint small">Every loose piece in the photo is placed at once, in its best spot. Orange dashed cells are
-        guesses. Hatched cells have no matching piece in the photo yet.</p>
+      <p class="hint small">Every loose piece in the photos is matched at once, to its best spot. Only pieces the app is
+        confident about are shown; hatched cells are still open. Tick "Show guesses too" to see the rest, outlined in
+        orange.</p>
     </div>
   </div>
 
   <div id="busy" class="busy" hidden><div class="spinner"></div><div id="busy-text">Working…</div></div>
   <div id="toast" class="toast" hidden></div>
 
-  <script type="module" src="js/app.js"></script>
+  <script type="module" src="js/app.js?v=8afa003f67"></script>
 </body>
 </html>
